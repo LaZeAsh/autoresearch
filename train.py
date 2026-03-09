@@ -18,9 +18,9 @@ import torch.nn.functional as F
 
 from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+# Keep the original FA3 path on Hopper; use PyTorch SDPA elsewhere.
+use_fa3 = cap == (9, 0)
+fa3 = get_kernel("varunneal/flash-attention-3").flash_attn_interface if use_fa3 else None
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -57,6 +57,13 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3)
 
 
+def make_window_mask(seq_len, window_size, device):
+    left, right = window_size
+    positions = torch.arange(seq_len, device=device)
+    rel = positions[:, None] - positions[None, :]
+    return (rel >= -right) & (rel <= left)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -89,7 +96,20 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        if fa3 is not None:
+            y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        else:
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            if self.n_kv_head != self.n_head:
+                repeat = self.n_head // self.n_kv_head
+                k = k.repeat_interleave(repeat, dim=1)
+                v = v.repeat_interleave(repeat, dim=1)
+            if window_size[0] >= T and window_size[1] == 0:
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            else:
+                attn_mask = make_window_mask(T, window_size, q.device)
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+            y = y.transpose(1, 2)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -447,7 +467,7 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+DEVICE_BATCH_SIZE = 64  # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader

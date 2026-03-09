@@ -14,10 +14,12 @@ import sys
 import time
 import math
 import argparse
+import json
 import pickle
 from multiprocessing import Pool
 
 import requests
+import pyarrow as pa
 import pyarrow.parquet as pq
 import rustbpe
 import tiktoken
@@ -35,11 +37,30 @@ EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
 # Configuration
 # ---------------------------------------------------------------------------
 
+BASE_URL = "https://huggingface.co/datasets/wangxiangyu0814/UAV-Flow/"
+
+
+def parse_dataset_repo_id(base_url):
+    """Extract `owner/name` from a Hugging Face dataset URL."""
+    value = base_url.rstrip("/")
+    if "/api/datasets/" in value:
+        value = value.split("/api/datasets/", 1)[1]
+    elif "/datasets/" in value:
+        value = value.split("/datasets/", 1)[1]
+    else:
+        value = value.replace("https://huggingface.co/", "").replace("http://huggingface.co/", "")
+    parts = [part for part in value.split("/") if part]
+    if len(parts) < 2:
+        raise ValueError(f"BASE_URL must point to a Hugging Face dataset, got: {base_url}")
+    return f"{parts[0]}/{parts[1]}"
+
+
+DATASET_REPO_ID = parse_dataset_repo_id(BASE_URL)
+DATASET_SLUG = DATASET_REPO_ID.replace("/", "__")
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
+DATA_DIR = os.path.join(CACHE_DIR, "data", DATASET_SLUG)
+TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer", DATASET_SLUG)
+MAX_SHARD = 6542 # reserved local shard id for the validation output filename
 VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
 VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
 VOCAB_SIZE = 8192
@@ -54,30 +75,142 @@ BOS_TOKEN = "<|reserved_0|>"
 # Data download
 # ---------------------------------------------------------------------------
 
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
+def get_remote_parquet_urls():
+    """Return the flat list of parquet URLs exposed by the dataset API."""
+    api_url = f"https://huggingface.co/api/datasets/{DATASET_REPO_ID}/parquet"
+    response = requests.get(api_url, timeout=30)
+    response.raise_for_status()
+    payload = response.json()
+    urls = []
+    for config_splits in payload.values():
+        for split_urls in config_splits.values():
+            urls.extend(split_urls)
+    if len(urls) < 2:
+        raise RuntimeError(
+            f"Expected at least 2 parquet files for train/val from {DATASET_REPO_ID}, found {len(urls)}"
+        )
+    return urls
+
+
+def format_float(value):
+    value = float(value)
+    if not math.isfinite(value):
+        return str(value)
+    text = f"{value:.6f}".rstrip("0").rstrip(".")
+    return text if text else "0"
+
+
+def format_state(values):
+    return "[" + ", ".join(format_float(v) for v in values) + "]"
+
+
+def build_spatial_text(episode_id, frame_idx, raw_logs, instruction):
+    """Convert one UAV-Flow row into a text-only training document."""
+    if not raw_logs:
+        return None
+    rows = []
+    for values in raw_logs:
+        if not isinstance(values, list):
+            continue
+        try:
+            rows.append([float(v) for v in values])
+        except (TypeError, ValueError):
+            continue
+    if not rows:
+        return None
+
+    start_state = rows[0]
+    end_state = rows[-1]
+    delta_state = [end - start for start, end in zip(start_state, end_state)]
+    lines = [
+        "task: infer the navigation instruction from raw drone flight logs",
+        f"episode_id: {episode_id}",
+        f"frame_idx: {frame_idx}",
+        f"num_steps: {len(rows)}",
+        f"log_dims: {len(rows[0])}",
+        f"start_state: {format_state(start_state)}",
+        f"end_state: {format_state(end_state)}",
+        f"delta_end_start: {format_state(delta_state)}",
+        "raw_logs:",
+    ]
+    for idx, values in enumerate(rows):
+        lines.append(f"step_{idx:03d}: {format_state(values)}")
+    lines.append("instruction:")
+    lines.append(instruction.strip())
+    return "\n".join(lines)
+
+
+def log_entry_to_text(episode_id, frame_idx, log_blob):
+    """Parse the dataset row and emit a text document for the tokenizer/model."""
+    try:
+        payload = json.loads(log_blob) if isinstance(log_blob, str) else log_blob
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    raw_logs = payload.get("raw_logs")
+    instruction = payload.get("instruction_unified") or payload.get("instruction")
+    if not raw_logs or not instruction:
+        return None
+    return build_spatial_text(episode_id, frame_idx, raw_logs, instruction)
+
+
+def convert_remote_parquet(source_path, dest_path):
+    """Rewrite a source parquet file into a local text-only shard."""
+    parquet_file = pq.ParquetFile(source_path)
+    writer = None
+    wrote_any_rows = False
+    try:
+        for rg_idx in range(parquet_file.num_row_groups):
+            rg = parquet_file.read_row_group(rg_idx, columns=["id", "frame_idx", "log"])
+            ids = rg.column("id").to_pylist()
+            frame_idxs = rg.column("frame_idx").to_pylist()
+            logs = rg.column("log").to_pylist()
+            texts = []
+            for episode_id, frame_idx, log_blob in zip(ids, frame_idxs, logs):
+                text = log_entry_to_text(episode_id, frame_idx, log_blob)
+                if text is not None:
+                    texts.append(text)
+            if not texts:
+                continue
+            table = pa.table({"text": texts})
+            if writer is None:
+                writer = pq.ParquetWriter(dest_path, table.schema)
+            writer.write_table(table)
+            wrote_any_rows = True
+    finally:
+        if writer is not None:
+            writer.close()
+    if not wrote_any_rows:
+        raise RuntimeError(f"No usable rows found in {source_path}")
+
+
+def download_single_shard(task):
+    """Download one remote parquet part and convert it into a local text shard."""
+    source_url, filename = task
     filepath = os.path.join(DATA_DIR, filename)
     if os.path.exists(filepath):
         return True
 
-    url = f"{BASE_URL}/{filename}"
+    download_tmp = filepath + ".download.tmp"
+    converted_tmp = filepath + ".tmp"
     max_attempts = 5
     for attempt in range(1, max_attempts + 1):
         try:
-            response = requests.get(url, stream=True, timeout=30)
+            response = requests.get(source_url, stream=True, timeout=30)
             response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
+            with open(download_tmp, "wb") as f:
                 for chunk in response.iter_content(chunk_size=1024 * 1024):
                     if chunk:
                         f.write(chunk)
-            os.rename(temp_path, filepath)
+            convert_remote_parquet(download_tmp, converted_tmp)
+            os.rename(converted_tmp, filepath)
             print(f"  Downloaded {filename}")
             return True
-        except (requests.RequestException, IOError) as e:
+        except (requests.RequestException, IOError, RuntimeError, pa.ArrowInvalid, pa.ArrowException) as e:
             print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
+            for path in [download_tmp, converted_tmp, filepath]:
                 if os.path.exists(path):
                     try:
                         os.remove(path)
@@ -91,26 +224,31 @@ def download_single_shard(index):
 def download_data(num_shards, download_workers=8):
     """Download training shards + pinned validation shard."""
     os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
+    remote_urls = get_remote_parquet_urls()
+    train_urls = remote_urls[:-1]
+    val_url = remote_urls[-1]
+    if num_shards is None:
+        num_train = len(train_urls)
+    else:
+        num_train = min(num_shards, len(train_urls))
+    tasks = [(url, f"shard_{idx:05d}.parquet") for idx, url in enumerate(train_urls[:num_train])]
+    tasks.append((val_url, VAL_FILENAME))
 
     # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
+    existing = sum(1 for _, filename in tasks if os.path.exists(os.path.join(DATA_DIR, filename)))
+    if existing == len(tasks):
+        print(f"Data: all {len(tasks)} shards already downloaded at {DATA_DIR}")
         return
 
-    needed = len(ids) - existing
+    needed = len(tasks) - existing
     print(f"Data: downloading {needed} shards ({existing} already exist)...")
 
     workers = max(1, min(download_workers, needed))
     with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
+        results = pool.map(download_single_shard, tasks)
 
     ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
+    print(f"Data: {ok}/{len(tasks)} shards ready at {DATA_DIR}")
 
 # ---------------------------------------------------------------------------
 # Tokenizer training
@@ -369,11 +507,11 @@ def evaluate_bpb(model, tokenizer, batch_size):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
+    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all available remote shards). Validation is always added.")
     parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
     args = parser.parse_args()
 
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
+    num_shards = None if args.num_shards == -1 else args.num_shards
 
     print(f"Cache directory: {CACHE_DIR}")
     print()
