@@ -298,7 +298,7 @@ class GPT(nn.Module):
             x = block(x, ve, cos_sin, self.window_sizes[i])
         x = norm(x)
 
-        softcap = 15
+        softcap = 30
         logits = self.lm_head(x)
         logits = logits.float()
         logits = softcap * torch.tanh(logits / softcap)
