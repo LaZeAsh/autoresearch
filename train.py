@@ -510,6 +510,7 @@ optimizer_kwargs = {
     "lr": LEARNING_RATE,
     "betas": ADAM_BETAS,
     "weight_decay": WEIGHT_DECAY,
+    "amsgrad": True,
 }
 if device.type == "cuda":
     optimizer_kwargs["fused"] = True
