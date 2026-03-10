@@ -173,8 +173,6 @@ class MLP(nn.Module):
         return self.dropout(self.proj(F.silu(self.gate(x)) * self.fc(x)))
 
 
-STOCHASTIC_DEPTH_RATE = 0.1
-
 class Block(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -184,8 +182,6 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None) -> torch.Tensor:
-        if self.training and STOCHASTIC_DEPTH_RATE > 0 and torch.rand(1).item() < STOCHASTIC_DEPTH_RATE:
-            return x
         x = x + self.attn(self.norm1(x), attn_mask)
         x = x + self.mlp(self.norm2(x))
         return x
