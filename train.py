@@ -248,7 +248,6 @@ class LightweightActionPolicy(nn.Module):
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         self.final_norm = RMSNorm(config.n_embd)
         self.action_head = nn.Linear(config.n_embd, config.action_vocab_size, bias=False)
-        self.action_regression_head = nn.Linear(config.n_embd, config.action_dim, bias=False)
         self.waypoint_head = (
             nn.Linear(config.n_embd, config.waypoint_dim, bias=False) if config.waypoint_dim > 0 else None
         )
@@ -369,13 +368,6 @@ class LightweightActionPolicy(nn.Module):
         action_hidden = x[:, -target_len:]
         action_logits = self.action_head(action_hidden).float()
 
-        # Auxiliary continuous action predictions (per-timestep, averaged over dims)
-        action_cont = None
-        if self.training:
-            pooled_for_reg = action_hidden.view(batch_size, self.config.action_chunk_size, self.config.action_dim, -1)
-            pooled_for_reg = pooled_for_reg.mean(dim=2)  # [B, chunk, n_embd]
-            action_cont = self.action_regression_head(pooled_for_reg).float()
-
         waypoint_preds = None
         if self.waypoint_head is not None:
             pooled = action_hidden.view(batch_size, self.config.action_chunk_size, self.config.action_dim, -1)
@@ -384,7 +376,6 @@ class LightweightActionPolicy(nn.Module):
 
         return {
             "action_logits": action_logits,
-            "action_cont": action_cont,
             "waypoint_preds": waypoint_preds,
         }
 
@@ -413,12 +404,7 @@ def compute_loss(outputs: dict[str, torch.Tensor | None], batch: dict[str, torch
     if waypoint_preds is not None and waypoint_targets.numel() > 0 and waypoint_targets.size(-1) > 0:
         waypoint_loss = F.mse_loss(waypoint_preds, waypoint_targets, reduction="mean")
 
-    reg_loss = torch.zeros((), device=logits.device)
-    action_cont = outputs.get("action_cont")
-    if action_cont is not None:
-        reg_loss = F.mse_loss(action_cont, batch["action_targets"], reduction="mean")
-
-    total_loss = action_ce + WAYPOINT_LOSS_WEIGHT * waypoint_loss + 0.1 * reg_loss
+    total_loss = action_ce + WAYPOINT_LOSS_WEIGHT * waypoint_loss
     metrics = {
         "action_ce": action_ce.detach().item(),
         "waypoint_loss": waypoint_loss.detach().item() if waypoint_loss.numel() > 0 else 0.0,
