@@ -307,7 +307,6 @@ class LightweightActionPolicy(nn.Module):
         # Encode frames (CPU -> GPU)
         frames = batch["frames"].to(device)
         visual_tokens = self.vision_encoder(frames)  # [B, T*tpf, n_embd]
-        visual_global = visual_tokens.mean(dim=1, keepdim=True)  # [B, 1, n_embd]
         visual_tokens = visual_tokens + self.type_embed.weight[0]
         # Add per-frame temporal embedding
         tpf = self.config.tokens_per_frame
@@ -367,7 +366,6 @@ class LightweightActionPolicy(nn.Module):
         x = self.final_norm(x)
 
         action_hidden = x[:, -target_len:]
-        action_hidden = action_hidden + visual_global  # shortcut from CNN
         action_logits = self.action_head(action_hidden).float()
 
         waypoint_preds = None
