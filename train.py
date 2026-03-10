@@ -474,12 +474,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 use_cuda_amp = device.type == "cuda"
 
 
-USE_FP16 = True  # use float16 + GradScaler instead of bfloat16
-
 def autocast_context():
-    if not use_cuda_amp:
-        return contextlib.nullcontext()
-    return torch.amp.autocast(device_type="cuda", dtype=torch.float16 if USE_FP16 else torch.bfloat16)
+    return torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16) if use_cuda_amp else contextlib.nullcontext()
 
 
 runtime = build_vla_runtime(
@@ -531,7 +527,6 @@ print(f"Device: {device}")
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
 
-scaler = torch.amp.GradScaler(enabled=USE_FP16 and use_cuda_amp)
 
 # ---------------------------------------------------------------------------
 # Training loop
@@ -556,7 +551,7 @@ while True:
         with autocast_context():
             outputs = model(batch)
             loss, loss_metrics = compute_loss(outputs, batch, runtime.action_tokenizer)
-        scaler.scale(loss / grad_accum_steps).backward()
+        (loss / grad_accum_steps).backward()
         micro_total_loss += loss.detach().item()
         micro_action_ce += loss_metrics["action_ce"]
         total_windows += batch["frames"].size(0)
@@ -568,10 +563,8 @@ while True:
         group["lr"] = group["initial_lr"] * lr_multiplier
 
     if GRAD_CLIP_NORM > 0:
-        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
-    scaler.step(optimizer)
-    scaler.update()
+    optimizer.step()
     optimizer.zero_grad(set_to_none=True)
 
     if device.type == "cuda":
