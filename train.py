@@ -214,6 +214,10 @@ class VisionEncoder(nn.Module):
     def forward(self, frames: torch.Tensor) -> torch.Tensor:
         B, T, C, H, W = frames.shape
         x = frames.reshape(B * T, C, H, W)
+        if self.training and H > 224 and W > 224:
+            top = torch.randint(0, H - 224, (1,)).item()
+            left = torch.randint(0, W - 224, (1,)).item()
+            x = x[:, :, top:top+224, left:left+224]
         x = self.encoder(x)
         x = x.flatten(2).transpose(1, 2)  # [B*T, tokens_per_frame, n_embd]
         return x.reshape(B, T * self.tokens_per_frame, x.size(-1))
