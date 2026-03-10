@@ -42,8 +42,8 @@ from prepare import (
 # ---------------------------------------------------------------------------
 
 # Data / context
-HISTORY_FRAMES = 8
-FRAME_STRIDE = 2
+HISTORY_FRAMES = 4
+FRAME_STRIDE = 1
 ACTION_CHUNK_SIZE = 4
 PAST_ACTION_CHUNK_SIZE = 1
 MAX_INSTRUCTION_TOKENS = 64
