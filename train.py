@@ -247,6 +247,7 @@ class LightweightActionPolicy(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, config.max_seq_len, config.n_embd))
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         self.final_norm = RMSNorm(config.n_embd)
+        self.action_dim_embed = nn.Parameter(torch.zeros(config.action_dim, config.n_embd))
         self.action_head = nn.Linear(config.n_embd, config.action_vocab_size, bias=False)
         self.waypoint_head = (
             nn.Linear(config.n_embd, config.waypoint_dim, bias=False) if config.waypoint_dim > 0 else None
@@ -275,6 +276,7 @@ class LightweightActionPolicy(nn.Module):
         nn.init.normal_(self.action_embed.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.type_embed.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.frame_temporal_embed, mean=0.0, std=0.01)
+        nn.init.normal_(self.action_dim_embed, mean=0.0, std=0.02)
         nn.init.normal_(self.pos_embed, mean=0.0, std=0.01)
 
     def _build_attention_mask(
@@ -366,6 +368,9 @@ class LightweightActionPolicy(nn.Module):
         x = self.final_norm(x)
 
         action_hidden = x[:, -target_len:]
+        # Add per-dimension embedding: target_len = action_dim * chunk_size
+        dim_indices = torch.arange(target_len, device=device) % self.config.action_dim
+        action_hidden = action_hidden + self.action_dim_embed[dim_indices]
         action_logits = self.action_head(action_hidden).float()
 
         waypoint_preds = None
