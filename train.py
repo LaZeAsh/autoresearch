@@ -153,7 +153,7 @@ class CausalSelfAttention(nn.Module):
             q,
             k,
             v,
-            attn_mask=attn_mask,
+            is_causal=True,
             dropout_p=self.dropout if self.training else 0.0,
         )
         y = y.transpose(1, 2).contiguous().view(batch_size, seq_len, channels)
