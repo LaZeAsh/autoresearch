@@ -42,7 +42,7 @@ from prepare import (
 # ---------------------------------------------------------------------------
 
 # Data / context
-HISTORY_FRAMES = 2
+HISTORY_FRAMES = 4
 FRAME_STRIDE = 1
 ACTION_CHUNK_SIZE = 4
 PAST_ACTION_CHUNK_SIZE = 8
