@@ -51,7 +51,7 @@ USE_STATE = True
 USE_PAST_ACTIONS = True
 
 # Vision encoder
-TOKENS_PER_FRAME = 4  # 2x2 spatial grid per frame
+TOKENS_PER_FRAME = 16  # 4x4 spatial grid per frame
 
 # Context budget: visual + text tokens
 MAX_CONTEXT_TOKENS = HISTORY_FRAMES * TOKENS_PER_FRAME + MAX_INSTRUCTION_TOKENS  # 128
