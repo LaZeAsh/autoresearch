@@ -248,6 +248,7 @@ class LightweightActionPolicy(nn.Module):
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         self.final_norm = RMSNorm(config.n_embd)
         self.action_head = nn.Linear(config.n_embd, config.action_vocab_size, bias=False)
+        self.action_head.weight = self.action_embed.weight  # weight tying
         self.waypoint_head = (
             nn.Linear(config.n_embd, config.waypoint_dim, bias=False) if config.waypoint_dim > 0 else None
         )
