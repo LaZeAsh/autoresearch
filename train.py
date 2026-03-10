@@ -195,7 +195,7 @@ class VisionEncoder(nn.Module):
         self.tokens_per_frame = tokens_per_frame
         grid_size = int(tokens_per_frame ** 0.5)  # 4 for 16 tokens
         self.encoder = nn.Sequential(
-            nn.Conv2d(image_channels * 2, 32, 7, stride=4, padding=3),   # 256->64 (2x channels: frame + diff)
+            nn.Conv2d(image_channels, 32, 7, stride=4, padding=3),   # 256->64
             nn.GroupNorm(8, 32),
             nn.GELU(),
             nn.Conv2d(32, 64, 3, stride=2, padding=1),              # 64->32
@@ -213,12 +213,7 @@ class VisionEncoder(nn.Module):
 
     def forward(self, frames: torch.Tensor) -> torch.Tensor:
         B, T, C, H, W = frames.shape
-        # Concatenate frame diffs as extra channels
-        diffs = frames[:, 1:] - frames[:, :-1]  # [B, T-1, C, H, W]
-        first_diff = torch.zeros(B, 1, C, H, W, device=frames.device, dtype=frames.dtype)
-        diffs = torch.cat([first_diff, diffs], dim=1)  # [B, T, C, H, W]
-        x = torch.cat([frames, diffs], dim=2)  # [B, T, 2C, H, W]
-        x = x.reshape(B * T, 2 * C, H, W)
+        x = frames.reshape(B * T, C, H, W)
         x = self.encoder(x)
         x = x.flatten(2).transpose(1, 2)  # [B*T, tokens_per_frame, n_embd]
         return x.reshape(B, T * self.tokens_per_frame, x.size(-1))
