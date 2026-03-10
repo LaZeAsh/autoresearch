@@ -243,6 +243,7 @@ class LightweightActionPolicy(nn.Module):
         )
         self.action_embed = nn.Embedding(config.action_vocab_size, config.n_embd, padding_idx=0)
         self.type_embed = nn.Embedding(4, config.n_embd)  # 0=context, 1=state, 2=past_action, 3=future_action
+        self.frame_temporal_embed = nn.Parameter(torch.zeros(config.history_frames, 1, config.n_embd))
         self.pos_embed = nn.Parameter(torch.zeros(1, config.max_seq_len, config.n_embd))
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         self.final_norm = RMSNorm(config.n_embd)
@@ -273,6 +274,7 @@ class LightweightActionPolicy(nn.Module):
         nn.init.normal_(self.instruction_embed.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.action_embed.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.type_embed.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.frame_temporal_embed, mean=0.0, std=0.01)
         nn.init.normal_(self.pos_embed, mean=0.0, std=0.01)
 
     def _build_attention_mask(
@@ -304,8 +306,12 @@ class LightweightActionPolicy(nn.Module):
 
         # Encode frames (CPU -> GPU)
         frames = batch["frames"].to(device)
-        visual_tokens = self.vision_encoder(frames)
+        visual_tokens = self.vision_encoder(frames)  # [B, T*tpf, n_embd]
         visual_tokens = visual_tokens + self.type_embed.weight[0]
+        # Add per-frame temporal embedding
+        tpf = self.config.tokens_per_frame
+        temporal = self.frame_temporal_embed.expand(-1, tpf, -1).reshape(1, -1, self.config.n_embd)
+        visual_tokens = visual_tokens + temporal
 
         # Encode instructions (CPU -> GPU)
         instruction_tokens = batch["instruction_tokens"].to(device)
