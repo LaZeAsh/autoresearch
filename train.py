@@ -294,9 +294,7 @@ class LightweightActionPolicy(nn.Module):
         parts.append(torch.ones(batch_size, future_action_tokens.size(1), dtype=torch.bool, device=device))
         keep_mask = torch.cat(parts, dim=1)
         seq_len = keep_mask.size(1)
-        prefix_len = context_mask.size(1)
         causal = torch.ones(seq_len, seq_len, dtype=torch.bool, device=device).tril()
-        causal[:prefix_len, :prefix_len] = True  # bidirectional within context prefix
         return causal.unsqueeze(0).unsqueeze(1) & keep_mask[:, None, None, :]
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor | None]:
