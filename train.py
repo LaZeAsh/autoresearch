@@ -23,10 +23,10 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoConfig, AutoModel, AutoProcessor
 
 from prepare import (
     DEFAULT_EVAL_BATCHES,
+    INSTRUCTION_VOCAB_SIZE,
     MAX_SEQ_LEN,
     TIME_BUDGET,
     build_vla_runtime,
@@ -50,20 +50,21 @@ MAX_INSTRUCTION_TOKENS = 64
 USE_STATE = True
 USE_PAST_ACTIONS = True
 
-# Frozen backbone
-SMOLVLM_MODEL_ID = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
-SMOLVLM_DTYPE = "bfloat16"
-MAX_CONTEXT_TOKENS = 512
+# Vision encoder
+TOKENS_PER_FRAME = 16  # 4x4 spatial grid per frame
+
+# Context budget: visual + text tokens
+MAX_CONTEXT_TOKENS = HISTORY_FRAMES * TOKENS_PER_FRAME + MAX_INSTRUCTION_TOKENS  # 128
 
 # Trainable action policy
-DEPTH = 4
+DEPTH = 6
 N_HEAD = 8
 N_EMBD = 512
 MLP_RATIO = 4.0
 DROPOUT = 0.0
 
 # Optimization
-DEVICE_BATCH_SIZE = 4
+DEVICE_BATCH_SIZE = 32
 TOTAL_BATCH_SIZE = 32
 LEARNING_RATE = 3e-4
 WEIGHT_DECAY = 0.05
@@ -88,12 +89,13 @@ VAL_EVAL_BATCHES = DEFAULT_EVAL_BATCHES
 @dataclass
 class ModelConfig:
     max_seq_len: int
-    smolvlm_model_id: str
-    backbone_dtype: str
-    backbone_hidden_size: int
     max_context_tokens: int
     action_vocab_size: int
     history_frames: int
+    tokens_per_frame: int
+    image_channels: int
+    image_size: int
+    max_instruction_tokens: int
     use_state: bool
     state_dim: int
     use_past_actions: bool
@@ -106,8 +108,6 @@ class ModelConfig:
     n_embd: int
     mlp_ratio: float
     dropout: float
-    frame_mean: tuple[float, ...]
-    frame_std: tuple[float, ...]
 
     @property
     def target_action_token_count(self) -> int:
@@ -189,8 +189,36 @@ class Block(nn.Module):
         return x
 
 
-class FrozenSmolVLMActionPolicy(nn.Module):
-    def __init__(self, config: ModelConfig, instruction_tokenizer):
+class VisionEncoder(nn.Module):
+    """Lightweight CNN: each frame -> spatial patch tokens."""
+
+    def __init__(self, image_channels: int, image_size: int, n_embd: int, tokens_per_frame: int):
+        super().__init__()
+        self.tokens_per_frame = tokens_per_frame
+        grid_size = int(tokens_per_frame ** 0.5)  # 4 for 16 tokens
+        self.encoder = nn.Sequential(
+            nn.Conv2d(image_channels, 32, 7, stride=4, padding=3),   # 256->64
+            nn.GELU(),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),              # 64->32
+            nn.GELU(),
+            nn.Conv2d(64, 128, 3, stride=2, padding=1),             # 32->16
+            nn.GELU(),
+            nn.Conv2d(128, 256, 3, stride=2, padding=1),            # 16->8
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d(grid_size),                         # 8->4
+            nn.Conv2d(256, n_embd, 1),                               # channel proj
+        )
+
+    def forward(self, frames: torch.Tensor) -> torch.Tensor:
+        B, T, C, H, W = frames.shape
+        x = frames.reshape(B * T, C, H, W)
+        x = self.encoder(x)
+        x = x.flatten(2).transpose(1, 2)  # [B*T, tokens_per_frame, n_embd]
+        return x.reshape(B, T * self.tokens_per_frame, x.size(-1))
+
+
+class LightweightActionPolicy(nn.Module):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         if config.total_sequence_len > config.max_seq_len:
@@ -198,23 +226,10 @@ class FrozenSmolVLMActionPolicy(nn.Module):
                 f"Configured sequence length {config.total_sequence_len} exceeds MAX_SEQ_LEN={config.max_seq_len}"
             )
 
-        self.instruction_tokenizer = instruction_tokenizer
-        self.prompt_cache: dict[str, str] = {}
-        self.backbone_dtype = getattr(torch, config.backbone_dtype)
-
-        self.processor = AutoProcessor.from_pretrained(config.smolvlm_model_id)
-        self.processor.image_processor.do_image_splitting = False
-        self.processor.image_processor.do_rescale = False
-        self.smolvlm = AutoModel.from_pretrained(
-            config.smolvlm_model_id,
-            dtype=self.backbone_dtype,
-            attn_implementation="sdpa",
-            low_cpu_mem_usage=True,
+        self.vision_encoder = VisionEncoder(
+            config.image_channels, config.image_size, config.n_embd, config.tokens_per_frame,
         )
-        self.smolvlm.requires_grad_(False)
-        self.smolvlm.eval()
-
-        self.context_proj = nn.Linear(config.backbone_hidden_size, config.n_embd, bias=False)
+        self.instruction_embed = nn.Embedding(INSTRUCTION_VOCAB_SIZE, config.n_embd, padding_idx=0)
         self.state_proj = (
             nn.Sequential(
                 nn.Linear(config.state_dim, config.n_embd, bias=False),
@@ -225,7 +240,7 @@ class FrozenSmolVLMActionPolicy(nn.Module):
             else None
         )
         self.action_embed = nn.Embedding(config.action_vocab_size, config.n_embd, padding_idx=0)
-        self.type_embed = nn.Embedding(4, config.n_embd)
+        self.type_embed = nn.Embedding(4, config.n_embd)  # 0=context, 1=state, 2=past_action, 3=future_action
         self.pos_embed = nn.Parameter(torch.zeros(1, config.max_seq_len, config.n_embd))
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         self.final_norm = RMSNorm(config.n_embd)
@@ -233,74 +248,30 @@ class FrozenSmolVLMActionPolicy(nn.Module):
         self.waypoint_head = (
             nn.Linear(config.n_embd, config.waypoint_dim, bias=False) if config.waypoint_dim > 0 else None
         )
-        self._init_trainable_weights()
+        self._init_weights()
 
-    def train(self, mode: bool = True):
-        super().train(mode)
-        self.smolvlm.eval()
-        return self
-
-    def _init_trainable_weights(self) -> None:
+    def _init_weights(self) -> None:
         def init_module(module: nn.Module) -> None:
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 if getattr(module, "bias", None) is not None:
                     nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
-        self.context_proj.apply(init_module)
+        self.vision_encoder.apply(init_module)
         if self.state_proj is not None:
             self.state_proj.apply(init_module)
         self.blocks.apply(init_module)
         self.action_head.apply(init_module)
         if self.waypoint_head is not None:
             self.waypoint_head.apply(init_module)
+        nn.init.normal_(self.instruction_embed.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.action_embed.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.type_embed.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.pos_embed, mean=0.0, std=0.01)
-
-    def _decode_instruction_texts(self, instruction_tokens: torch.Tensor) -> list[str]:
-        tokens_cpu = instruction_tokens.detach().cpu()
-        return [self.instruction_tokenizer.decode(row) for row in tokens_cpu]
-
-    def _build_prompt(self, instruction: str) -> str:
-        cached = self.prompt_cache.get(instruction)
-        if cached is not None:
-            return cached
-        message = [
-            {
-                "role": "user",
-                "content": [{"type": "image"} for _ in range(self.config.history_frames)]
-                + [{"type": "text", "text": instruction}],
-            }
-        ]
-        prompt = self.processor.apply_chat_template(message, add_generation_prompt=False)
-        self.prompt_cache[instruction] = prompt
-        return prompt
-
-    def _frames_to_images(self, frames: torch.Tensor) -> list[list[torch.Tensor]]:
-        frames_cpu = frames.detach().cpu().to(torch.float32)
-        mean = torch.tensor(self.config.frame_mean, dtype=torch.float32).view(1, 1, -1, 1, 1)
-        std = torch.tensor(self.config.frame_std, dtype=torch.float32).view(1, 1, -1, 1, 1)
-        raw_frames = (frames_cpu * std + mean).clamp_(0.0, 1.0)
-        return [[frame for frame in sample] for sample in raw_frames]
-
-    def _prepare_backbone_inputs(self, batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
-        instructions = self._decode_instruction_texts(batch["instruction_tokens"])
-        prompts = [self._build_prompt(text) for text in instructions]
-        images = self._frames_to_images(batch["frames"])
-        inputs = self.processor(
-            text=prompts,
-            images=images,
-            return_tensors="pt",
-            padding=True,
-        )
-        prepared = {}
-        for key, value in inputs.items():
-            if torch.is_floating_point(value):
-                prepared[key] = value.to(device=device, dtype=self.backbone_dtype)
-            else:
-                prepared[key] = value.to(device)
-        return prepared
 
     def _build_attention_mask(
         self,
@@ -327,26 +298,37 @@ class FrozenSmolVLMActionPolicy(nn.Module):
         past_action_tokens = batch["past_action_tokens"]
         batch_size = target_action_tokens.size(0)
         target_len = target_action_tokens.size(1)
-        backbone_device = self.pos_embed.device
+        device = self.pos_embed.device
 
-        smolvlm_inputs = self._prepare_backbone_inputs(batch, device=backbone_device)
-        with torch.no_grad():
-            backbone_outputs = self.smolvlm(**smolvlm_inputs, return_dict=True, use_cache=False)
+        # Encode frames (CPU -> GPU)
+        frames = batch["frames"].to(device)
+        visual_tokens = self.vision_encoder(frames)
+        visual_tokens = visual_tokens + self.type_embed.weight[0]
 
-        context_tokens = self.context_proj(backbone_outputs.last_hidden_state.to(torch.float32))
-        context_tokens = context_tokens + self.type_embed.weight[0]
-        context_mask = smolvlm_inputs["attention_mask"].bool()
+        # Encode instructions (CPU -> GPU)
+        instruction_tokens = batch["instruction_tokens"].to(device)
+        instruction_mask = batch["instruction_mask"].to(device)
+        text_tokens = self.instruction_embed(instruction_tokens)
+        text_tokens = text_tokens + self.type_embed.weight[0]
 
+        # Combine context
+        context_tokens = torch.cat([visual_tokens, text_tokens], dim=1)
+        visual_mask = torch.ones(batch_size, visual_tokens.size(1), dtype=torch.bool, device=device)
+        context_mask = torch.cat([visual_mask, instruction_mask], dim=1)
+
+        # State
         state_tokens = None
         if self.state_proj is not None and batch["states"].numel() > 0:
             state_tokens = self.state_proj(batch["states"]).unsqueeze(1)
             state_tokens = state_tokens + self.type_embed.weight[1]
 
+        # Past actions
         past_tokens = None
         if self.config.use_past_actions and past_action_tokens.numel() > 0:
             past_tokens = self.action_embed(past_action_tokens)
             past_tokens = past_tokens + self.type_embed.weight[2]
 
+        # Future actions (teacher forcing)
         bos = torch.full(
             (batch_size, 1),
             fill_value=1,
@@ -357,6 +339,7 @@ class FrozenSmolVLMActionPolicy(nn.Module):
         future_tokens = self.action_embed(teacher_tokens)
         future_tokens = future_tokens + self.type_embed.weight[3]
 
+        # Assemble full sequence
         sequence_parts = [context_tokens]
         if state_tokens is not None:
             sequence_parts.append(state_tokens)
@@ -439,15 +422,15 @@ def count_parameters(model: nn.Module, trainable_only: bool = False) -> int:
 
 def build_model_config(runtime) -> ModelConfig:
     metadata = runtime.metadata
-    backbone_config = AutoConfig.from_pretrained(SMOLVLM_MODEL_ID)
     config = ModelConfig(
         max_seq_len=MAX_SEQ_LEN,
-        smolvlm_model_id=SMOLVLM_MODEL_ID,
-        backbone_dtype=SMOLVLM_DTYPE,
-        backbone_hidden_size=backbone_config.text_config.hidden_size,
         max_context_tokens=MAX_CONTEXT_TOKENS,
         action_vocab_size=runtime.action_tokenizer.get_vocab_size(),
         history_frames=HISTORY_FRAMES,
+        tokens_per_frame=TOKENS_PER_FRAME,
+        image_channels=metadata.image_channels,
+        image_size=metadata.image_size,
+        max_instruction_tokens=MAX_INSTRUCTION_TOKENS,
         use_state=USE_STATE and metadata.has_state,
         state_dim=metadata.state_dim if USE_STATE else 0,
         use_past_actions=USE_PAST_ACTIONS,
@@ -460,8 +443,6 @@ def build_model_config(runtime) -> ModelConfig:
         n_embd=N_EMBD,
         mlp_ratio=MLP_RATIO,
         dropout=DROPOUT,
-        frame_mean=metadata.frame_mean,
-        frame_std=metadata.frame_std,
     )
     if config.total_sequence_len > MAX_SEQ_LEN:
         raise ValueError(
@@ -511,7 +492,7 @@ if TOTAL_BATCH_SIZE % DEVICE_BATCH_SIZE != 0:
     raise ValueError("TOTAL_BATCH_SIZE must be divisible by DEVICE_BATCH_SIZE")
 grad_accum_steps = TOTAL_BATCH_SIZE // DEVICE_BATCH_SIZE
 
-model = FrozenSmolVLMActionPolicy(config, runtime.instruction_tokenizer).to(device)
+model = LightweightActionPolicy(config).to(device)
 if USE_COMPILE:
     model = torch.compile(model, dynamic=False)
 num_params = count_parameters(model)
