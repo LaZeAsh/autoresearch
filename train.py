@@ -475,7 +475,7 @@ use_cuda_amp = device.type == "cuda"
 
 
 def autocast_context():
-    return torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16) if use_cuda_amp else contextlib.nullcontext()
+    return contextlib.nullcontext()  # pure FP32
 
 
 runtime = build_vla_runtime(
