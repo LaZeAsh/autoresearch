@@ -164,15 +164,13 @@ class MLP(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         hidden_dim = int(config.n_embd * config.mlp_ratio)
+        self.gate = nn.Linear(config.n_embd, hidden_dim, bias=False)
         self.fc = nn.Linear(config.n_embd, hidden_dim, bias=False)
         self.proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.fc(x)
-        x = F.gelu(x, approximate="tanh")
-        x = self.proj(x)
-        return self.dropout(x)
+        return self.dropout(self.proj(F.silu(self.gate(x)) * self.fc(x)))
 
 
 class Block(nn.Module):
