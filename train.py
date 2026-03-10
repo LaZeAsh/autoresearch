@@ -506,16 +506,24 @@ if USE_COMPILE:
 num_params = count_parameters(model)
 trainable_params = count_parameters(model, trainable_only=True)
 
-optimizer_kwargs = {
-    "lr": LEARNING_RATE,
-    "betas": ADAM_BETAS,
-    "weight_decay": WEIGHT_DECAY,
-}
-if device.type == "cuda":
-    optimizer_kwargs["fused"] = True
+decay_params = []
+no_decay_params = []
+for name, param in model.named_parameters():
+    if not param.requires_grad:
+        continue
+    if param.ndim <= 1 or "embed" in name:
+        no_decay_params.append(param)
+    else:
+        decay_params.append(param)
+fused = device.type == "cuda"
 optimizer = torch.optim.AdamW(
-    [parameter for parameter in model.parameters() if parameter.requires_grad],
-    **optimizer_kwargs,
+    [
+        {"params": decay_params, "weight_decay": WEIGHT_DECAY},
+        {"params": no_decay_params, "weight_decay": 0.0},
+    ],
+    lr=LEARNING_RATE,
+    betas=ADAM_BETAS,
+    fused=fused,
 )
 for group in optimizer.param_groups:
     group["initial_lr"] = group["lr"]
