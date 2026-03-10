@@ -387,7 +387,7 @@ class LightweightActionPolicy(nn.Module):
 
 def masked_action_logits(logits: torch.Tensor, action_tokenizer) -> torch.Tensor:
     mask = action_tokenizer.valid_token_mask(logits.size(1), logits.device)
-    return logits.masked_fill(~mask.unsqueeze(0), torch.finfo(logits.dtype).min)
+    return logits.masked_fill(~mask.unsqueeze(0), -1e4)
 
 
 def compute_loss(outputs: dict[str, torch.Tensor | None], batch: dict[str, torch.Tensor], action_tokenizer) -> tuple[torch.Tensor, dict[str, float]]:
