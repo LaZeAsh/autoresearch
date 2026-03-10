@@ -415,9 +415,10 @@ def compute_loss(outputs: dict[str, torch.Tensor | None], batch: dict[str, torch
 def get_lr_multiplier(progress: float) -> float:
     if progress < WARMUP_RATIO:
         return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
-    # Cosine decay from peak to FINAL_LR_FRAC
-    decay_progress = (progress - WARMUP_RATIO) / (1.0 - WARMUP_RATIO)
-    return FINAL_LR_FRAC + 0.5 * (1.0 - FINAL_LR_FRAC) * (1.0 + math.cos(math.pi * decay_progress))
+    if progress < 1.0 - WARMDOWN_RATIO:
+        return 1.0
+    cooldown = (1.0 - progress) / WARMDOWN_RATIO
+    return cooldown + (1.0 - cooldown) * FINAL_LR_FRAC
 
 
 def count_parameters(model: nn.Module, trainable_only: bool = False) -> int:
