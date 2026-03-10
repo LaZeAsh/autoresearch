@@ -214,8 +214,6 @@ class VisionEncoder(nn.Module):
     def forward(self, frames: torch.Tensor) -> torch.Tensor:
         B, T, C, H, W = frames.shape
         x = frames.reshape(B * T, C, H, W)
-        if H > 128 or W > 128:
-            x = F.interpolate(x, size=(128, 128), mode="bilinear", align_corners=False)
         x = self.encoder(x)
         x = x.flatten(2).transpose(1, 2)  # [B*T, tokens_per_frame, n_embd]
         return x.reshape(B, T * self.tokens_per_frame, x.size(-1))
