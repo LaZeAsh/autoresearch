@@ -242,7 +242,7 @@ class LightweightActionPolicy(nn.Module):
             else None
         )
         self.action_embed = nn.Embedding(config.action_vocab_size, config.n_embd, padding_idx=0)
-        self.type_embed = nn.Embedding(4, config.n_embd)  # 0=context, 1=state, 2=past_action, 3=future_action
+        self.type_embed = nn.Embedding(5, config.n_embd)  # 0=visual, 1=text, 2=state, 3=past_action, 4=future_action
         self.frame_temporal_embed = nn.Parameter(torch.zeros(config.history_frames, 1, config.n_embd))
         self.pos_embed = nn.Parameter(torch.zeros(1, config.max_seq_len, config.n_embd))
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
@@ -317,7 +317,7 @@ class LightweightActionPolicy(nn.Module):
         instruction_tokens = batch["instruction_tokens"].to(device)
         instruction_mask = batch["instruction_mask"].to(device)
         text_tokens = self.instruction_embed(instruction_tokens)
-        text_tokens = text_tokens + self.type_embed.weight[0]
+        text_tokens = text_tokens + self.type_embed.weight[1]
 
         # Combine context
         context_tokens = torch.cat([visual_tokens, text_tokens], dim=1)
@@ -328,13 +328,13 @@ class LightweightActionPolicy(nn.Module):
         state_tokens = None
         if self.state_proj is not None and batch["states"].numel() > 0:
             state_tokens = self.state_proj(batch["states"]).unsqueeze(1)
-            state_tokens = state_tokens + self.type_embed.weight[1]
+            state_tokens = state_tokens + self.type_embed.weight[2]
 
         # Past actions
         past_tokens = None
         if self.config.use_past_actions and past_action_tokens.numel() > 0:
             past_tokens = self.action_embed(past_action_tokens)
-            past_tokens = past_tokens + self.type_embed.weight[2]
+            past_tokens = past_tokens + self.type_embed.weight[3]
 
         # Future actions (teacher forcing)
         bos = torch.full(
@@ -345,7 +345,7 @@ class LightweightActionPolicy(nn.Module):
         )
         teacher_tokens = torch.cat([bos, target_action_tokens[:, :-1]], dim=1)
         future_tokens = self.action_embed(teacher_tokens)
-        future_tokens = future_tokens + self.type_embed.weight[3]
+        future_tokens = future_tokens + self.type_embed.weight[4]
 
         # Assemble full sequence
         sequence_parts = [context_tokens]
