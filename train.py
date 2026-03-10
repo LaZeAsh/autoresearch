@@ -71,7 +71,6 @@ WEIGHT_DECAY = 0.05
 ADAM_BETAS = (0.9, 0.95)
 GRAD_CLIP_NORM = 1.0
 WAYPOINT_LOSS_WEIGHT = 0.25
-LABEL_SMOOTHING = 0.1
 WARMUP_RATIO = 0.05
 WARMDOWN_RATIO = 0.50
 FINAL_LR_FRAC = 0.10
@@ -387,7 +386,7 @@ class LightweightActionPolicy(nn.Module):
 
 def masked_action_logits(logits: torch.Tensor, action_tokenizer) -> torch.Tensor:
     mask = action_tokenizer.valid_token_mask(logits.size(1), logits.device)
-    return logits.masked_fill(~mask.unsqueeze(0), -1e4)
+    return logits.masked_fill(~mask.unsqueeze(0), torch.finfo(logits.dtype).min)
 
 
 def compute_loss(outputs: dict[str, torch.Tensor | None], batch: dict[str, torch.Tensor], action_tokenizer) -> tuple[torch.Tensor, dict[str, float]]:
@@ -397,7 +396,6 @@ def compute_loss(outputs: dict[str, torch.Tensor | None], batch: dict[str, torch
         logits.reshape(-1, logits.size(-1)),
         targets.reshape(-1),
         reduction="mean",
-        label_smoothing=LABEL_SMOOTHING,
     )
 
     waypoint_loss = torch.zeros((), device=logits.device)
