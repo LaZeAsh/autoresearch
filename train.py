@@ -67,7 +67,6 @@ DROPOUT = 0.0
 DEVICE_BATCH_SIZE = 16
 TOTAL_BATCH_SIZE = 16
 LEARNING_RATE = 3e-4
-CNN_LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 0.01
 ADAM_BETAS = (0.9, 0.95)
 GRAD_CLIP_NORM = 1.0
@@ -507,19 +506,19 @@ if USE_COMPILE:
 num_params = count_parameters(model)
 trainable_params = count_parameters(model, trainable_only=True)
 
-cnn_params = list(model.vision_encoder.parameters())
-cnn_param_ids = {id(p) for p in cnn_params}
-other_params = [p for p in model.parameters() if p.requires_grad and id(p) not in cnn_param_ids]
-fused = device.type == "cuda"
+optimizer_kwargs = {
+    "lr": LEARNING_RATE,
+    "betas": ADAM_BETAS,
+    "weight_decay": WEIGHT_DECAY,
+}
+if device.type == "cuda":
+    optimizer_kwargs["fused"] = True
 optimizer = torch.optim.AdamW(
-    [
-        {"params": cnn_params, "lr": CNN_LEARNING_RATE, "initial_lr": CNN_LEARNING_RATE},
-        {"params": other_params, "lr": LEARNING_RATE, "initial_lr": LEARNING_RATE},
-    ],
-    betas=ADAM_BETAS,
-    weight_decay=WEIGHT_DECAY,
-    fused=fused,
+    [parameter for parameter in model.parameters() if parameter.requires_grad],
+    **optimizer_kwargs,
 )
+for group in optimizer.param_groups:
+    group["initial_lr"] = group["lr"]
 
 train_batches = cycle(runtime.train_loader)
 batch_cpu, epoch = next(train_batches)
