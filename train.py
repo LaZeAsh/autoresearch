@@ -195,13 +195,10 @@ class VisionEncoder(nn.Module):
         self.tokens_per_frame = tokens_per_frame
         grid_size = int(tokens_per_frame ** 0.5)  # 4 for 16 tokens
         self.encoder = nn.Sequential(
-            nn.Conv2d(image_channels, 32, 3, stride=2, padding=1),   # 256->128
+            nn.Conv2d(image_channels, 32, 7, stride=4, padding=3),   # 256->64
             nn.GroupNorm(8, 32),
             nn.GELU(),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1),              # 128->64
-            nn.GroupNorm(8, 64),
-            nn.GELU(),
-            nn.Conv2d(64, 64, 3, stride=2, padding=1),              # 64->32
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),              # 64->32
             nn.GroupNorm(8, 64),
             nn.GELU(),
             nn.Conv2d(64, 128, 3, stride=2, padding=1),             # 32->16
