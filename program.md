@@ -146,31 +146,40 @@ The experiment runs on a dedicated branch, for example `autoresearch/mar10-vla`.
 
 LOOP FOREVER:
 
-1. Inspect the current git state and identify the current baseline commit.
-2. Edit only `train.py` with one concrete experimental idea.
-3. Commit the change.
-4. Run the experiment: `uv run train.py > run.log 2>&1`
-5. Extract the summary metrics from `run.log`.
-6. If the summary is missing, treat the run as a crash. Read the traceback, attempt a fast fix if the issue is trivial, otherwise log it as a crash and move on.
-7. Append the result to `results.tsv`.
-8. If `score` improved, advance the branch and keep the commit.
-9. If `score` is equal or worse, revert to the previous baseline commit.
+1. Look at the git state: the current branch/commit we're on
+2. Tune train.py with an experimental idea by directly hacking the code.
+3. git commit
+4. Run the experiment: uv run train.py > run.log 2>&1 (redirect everything — do NOT use tee or let output flood your context)
+5. Read out the results: grep "^val_bpb:\|^peak_vram_mb:" run.log
+6. If the grep output is empty, the run crashed. Run tail -n 50 run.log to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
+7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
+8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
+9. If val_bpb is equal or worse, you git reset back to where you started
 
-## Timeout and crash policy
+The idea is that you are a completely autonomous researcher
+trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
 
-- A healthy run should finish in roughly 5 minutes plus startup and evaluation overhead.
-- If a run exceeds 10 minutes, kill it, log it as a failure, and revert.
-- If a crash is caused by a trivial bug introduced in `train.py`, fix it and rerun once.
-- If the core idea is broken, log the crash and move on.
+Timeout: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
 
-## Never Stop
+Crashes: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
 
-Once the loop has started, do not stop after partial progress and do not ask the human for permission to continue. Keep going until you are manually interrupted.
+NEVER STOP: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working indefinitely until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
 
-Only pause if there is a true external blocker, such as:
+As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
 
-- the dataset is missing or malformed
-- the environment is broken in a way you cannot repair from the repo
-- the human must make a decision that changes the experiment objective
+## Ideas
 
-Otherwise continue researching indefinitely. The user may be asleep; autonomous continuation is the expected mode.
+You are working on a model for autonomous drone focused on task completion. Think about what different architectures have to offer
+
+These are some of my ideas that you can build on / try out:
+
+- Follow SmolVLA approach, initialize action head weights from scratch otherwise initialize action head and run LoRA
+- Look into Physical Intelligence's research with Pi 0 / 0.5 / 0.6, try using their checkpoints / architecture with the dataset
+- Try a RL approach to training the action head, with a reward function that encourages task completion, improving long horizon tasks
+- Different research papers to look into:
+  - AIR-VLA: https://arxiv.org/html/2601.21602v2
+  - DroneVLA: https://arxiv.org/abs/2601.13809
+  - VLA=AN: https://arxiv.org/abs/2512.15258
+  - Real-time chunking (RTC): https://arxiv.org/abs/2506.07339
+
+If you pick a major architectural idea stick with it for at least 20 iterations before trying another major approach. This is to ensure that you are able to evaluate the impact of the change on the overall performance of the model maintaing consistency.
