@@ -55,7 +55,7 @@ SMOLVLM_MODEL_ID = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
 SMOLVLM_DTYPE = "bfloat16"
 MAX_CONTEXT_TOKENS = 512
 BACKBONE_SKIP_LAYERS = 8  # Use only first N of 32 LM layers (0 = use all)
-LORA_RANK = 16  # LoRA rank for backbone adaptation (0 = no LoRA)
+LORA_RANK = 0  # LoRA rank for backbone adaptation (0 = no LoRA)
 LORA_ALPHA = 16.0  # LoRA scaling factor
 
 # Trainable action policy
