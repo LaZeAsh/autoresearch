@@ -73,6 +73,7 @@ WEIGHT_DECAY = 0.01
 ADAM_BETAS = (0.9, 0.999)
 GRAD_CLIP_NORM = 1.0
 WAYPOINT_LOSS_WEIGHT = 0.25
+LABEL_SMOOTHING = 0.1
 WARMUP_RATIO = 0.05
 WARMDOWN_RATIO = 0.30
 FINAL_LR_FRAC = 0.10
@@ -470,6 +471,7 @@ def compute_loss(
         logits.reshape(-1, logits.size(-1)),
         targets.reshape(-1),
         reduction="mean",
+        label_smoothing=LABEL_SMOOTHING,
     )
 
     waypoint_loss = torch.zeros((), device=logits.device)
