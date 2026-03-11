@@ -45,14 +45,14 @@ uv run train.py
 - Modify the dataset manifests, dataset split logic, preprocessing rules, action quantization rules, or evaluation weights.
 - Install new packages or add dependencies.
 - Change the meaning of the printed summary metrics.
-- Make sure to NOT replace the VLM backbone, experimenting with different VLMs is ok but the VLM backbone is essential to our VLA
+- Make sure to always use a VLM backbone, using different backbones is acceptable as long as it is a VLM.
 
 ### The optimization target
 
 The primary metric is:
 
 ```text
-score = - action_ce - waypoint_penalty - latency_penalty - invalid_action_penalty
+score = - action_ce - waypoint_penalty - invalid_action_penalty
 ```
 
 Higher `score` is better.
@@ -74,14 +74,6 @@ Do not optimize raw action cross-entropy in isolation. A change that lowers `val
 - Reject a change if it worsens `score`, increases invalid action behavior materially, or creates a large latency regression.
 - Prefer simpler changes when improvements are tied or nearly tied.
 - Do not keep ugly complexity for tiny gains.
-
-### Priority order for experiments
-
-1. Action representation and action-token decoding behavior
-2. Temporal context: history length, stride, and past-action conditioning
-3. Multimodal fusion of vision, language, and state
-4. Optimizer and schedule tuning
-5. Capacity scaling
 
 ## Output format
 
