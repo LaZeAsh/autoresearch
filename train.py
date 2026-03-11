@@ -23,6 +23,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoModel, AutoProcessor
 
 from prepare import (
@@ -30,6 +31,7 @@ from prepare import (
     MAX_SEQ_LEN,
     TIME_BUDGET,
     build_vla_runtime,
+    collate_vla_batch,
     cycle,
     evaluate_vla,
     format_eval_summary,
@@ -82,6 +84,7 @@ NUM_WORKERS = 0
 PIN_MEMORY = True
 
 # Evaluation
+EVAL_BATCH_SIZE = 4  # Separate eval batch size for lower latency
 VAL_EVAL_BATCHES = DEFAULT_EVAL_BATCHES
 
 
@@ -699,14 +702,26 @@ print()
 # ---------------------------------------------------------------------------
 
 model.eval()
+# Use separate eval batch size for lower per-batch latency
+eval_loader = DataLoader(
+    runtime.val_dataset,
+    batch_size=EVAL_BATCH_SIZE,
+    shuffle=False,
+    drop_last=False,
+    num_workers=0,
+    pin_memory=PIN_MEMORY,
+    collate_fn=collate_vla_batch,
+)
+# Scale max_batches to cover same number of samples
+eval_max_batches = max(1, VAL_EVAL_BATCHES * DEVICE_BATCH_SIZE // EVAL_BATCH_SIZE)
 with autocast_context():
     metrics = evaluate_vla(
         model=model,
-        val_loader=runtime.val_loader,
+        val_loader=eval_loader,
         action_tokenizer=runtime.action_tokenizer,
         metadata=runtime.metadata,
         device=device,
-        max_batches=VAL_EVAL_BATCHES,
+        max_batches=eval_max_batches,
     )
 
 t_end = time.time()
