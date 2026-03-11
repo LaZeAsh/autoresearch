@@ -183,3 +183,7 @@ These are some of my ideas that you can build on / try out:
   - Real-time chunking (RTC): https://arxiv.org/abs/2506.07339
 
 If you pick a major architectural idea stick with it for at least 20 iterations before trying another major approach. This is to ensure that you are able to evaluate the impact of the change on the overall performance of the model maintaing consistency.
+
+## Resources
+
+You are running on a RTX 5090 (32 gb vram), take advantage of it
