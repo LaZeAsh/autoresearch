@@ -45,6 +45,7 @@ uv run train.py
 - Modify the dataset manifests, dataset split logic, preprocessing rules, action quantization rules, or evaluation weights.
 - Install new packages or add dependencies.
 - Change the meaning of the printed summary metrics.
+- Make sure to NOT replace the VLM backbone, experimenting with different VLMs is ok but the VLM backbone is essential to our VLA
 
 ### The optimization target
 
