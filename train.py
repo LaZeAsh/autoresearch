@@ -282,7 +282,9 @@ class FrozenSmolVLMActionPolicy(nn.Module):
         return [self.instruction_tokenizer.decode(row) for row in tokens_cpu]
 
     def _get_input_ids(self, instruction: str) -> torch.Tensor:
-        """Get tokenized input_ids for an instruction (cached)."""
+        """Get tokenized input_ids for an instruction (cached).
+        Uses the full processor once with a dummy 512x512 image to get
+        correctly expanded image tokens, then caches for reuse."""
         cached = self._input_ids_cache.get(instruction)
         if cached is not None:
             return cached
@@ -294,7 +296,10 @@ class FrozenSmolVLMActionPolicy(nn.Module):
             }
         ]
         prompt = self.processor.apply_chat_template(message, add_generation_prompt=False)
-        ids = self.processor.tokenizer(prompt, return_tensors="pt").input_ids[0]
+        # Use a small dummy image just to get correct token expansion
+        dummy_img = torch.zeros(3, 512, 512)
+        out = self.processor(text=[prompt], images=[[dummy_img]], return_tensors="pt")
+        ids = out["input_ids"][0]
         self._input_ids_cache[instruction] = ids
         return ids
 
