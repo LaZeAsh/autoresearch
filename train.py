@@ -54,7 +54,9 @@ USE_PAST_ACTIONS = True
 SMOLVLM_MODEL_ID = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
 SMOLVLM_DTYPE = "bfloat16"
 MAX_CONTEXT_TOKENS = 512
-BACKBONE_SKIP_LAYERS = 16  # Use only first N of 32 LM layers (0 = use all)
+BACKBONE_SKIP_LAYERS = 8  # Use only first N of 32 LM layers (0 = use all)
+LORA_RANK = 16  # LoRA rank for backbone adaptation (0 = no LoRA)
+LORA_ALPHA = 16.0  # LoRA scaling factor
 
 # Trainable action policy
 DEPTH = 4
@@ -121,6 +123,20 @@ class ModelConfig:
     @property
     def total_sequence_len(self) -> int:
         return self.max_context_tokens + self.state_token_count + self.past_action_token_count + self.target_action_token_count
+
+
+class LoRALinear(nn.Module):
+    """Low-rank adaptation wrapper for a frozen Linear layer."""
+    def __init__(self, base: nn.Linear, rank: int, alpha: float):
+        super().__init__()
+        self.base = base
+        self.scaling = alpha / rank
+        self.lora_A = nn.Parameter(torch.zeros(base.in_features, rank))
+        self.lora_B = nn.Parameter(torch.zeros(rank, base.out_features))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+
+    def forward(self, x):
+        return self.base(x) + (x @ self.lora_A @ self.lora_B) * self.scaling
 
 
 class RMSNorm(nn.Module):
@@ -217,6 +233,12 @@ class FrozenSmolVLMActionPolicy(nn.Module):
             total_layers = len(self.smolvlm.text_model.layers)
             keep = min(BACKBONE_SKIP_LAYERS, total_layers)
             self.smolvlm.text_model.layers = self.smolvlm.text_model.layers[:keep]
+
+        # LoRA: add low-rank adapters to LM attention layers
+        if LORA_RANK > 0:
+            for layer in self.smolvlm.text_model.layers:
+                layer.self_attn.q_proj = LoRALinear(layer.self_attn.q_proj, LORA_RANK, LORA_ALPHA)
+                layer.self_attn.v_proj = LoRALinear(layer.self_attn.v_proj, LORA_RANK, LORA_ALPHA)
 
         # Pre-compute normalization constants for fast GPU preprocessing
         # Dataset normalization: frame = (raw - mean) / std
@@ -365,10 +387,13 @@ class FrozenSmolVLMActionPolicy(nn.Module):
         target_len = target_action_tokens.size(1)
         device = target_action_tokens.device
 
-        # Frozen backbone
+        # Backbone (frozen base weights, LoRA adapters are trainable)
         backbone_inputs = self._prepare_backbone_inputs(batch, device)
-        with torch.no_grad():
+        if LORA_RANK > 0:
             backbone_outputs = self.smolvlm(**backbone_inputs)
+        else:
+            with torch.no_grad():
+                backbone_outputs = self.smolvlm(**backbone_inputs)
         context_hidden = backbone_outputs.last_hidden_state
         context_mask = backbone_inputs["attention_mask"]
         if context_hidden.size(1) > self.config.max_context_tokens:
