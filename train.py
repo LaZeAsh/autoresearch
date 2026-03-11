@@ -54,6 +54,7 @@ USE_PAST_ACTIONS = True
 SMOLVLM_MODEL_ID = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
 SMOLVLM_DTYPE = "bfloat16"
 MAX_CONTEXT_TOKENS = 512
+BACKBONE_SKIP_LAYERS = 16  # Use only first N of 32 LM layers (0 = use all)
 
 # Trainable action policy
 DEPTH = 4
@@ -212,6 +213,11 @@ class FrozenSmolVLMActionPolicy(nn.Module):
         )
         self.smolvlm.requires_grad_(False)
         self.smolvlm.eval()
+        # Layer skipping: truncate LM decoder layers for faster inference
+        if BACKBONE_SKIP_LAYERS > 0:
+            total_layers = len(self.smolvlm.text_model.layers)
+            keep = min(BACKBONE_SKIP_LAYERS, total_layers)
+            self.smolvlm.text_model.layers = self.smolvlm.text_model.layers[:keep]
 
         self.context_proj = nn.Linear(config.backbone_hidden_size, config.n_embd, bias=False)
         self.action_embed = nn.Embedding(config.action_vocab_size, config.n_embd)
