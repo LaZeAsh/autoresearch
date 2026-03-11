@@ -32,11 +32,14 @@ import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pyarrow.parquet as pq
 import torch
 import torch.nn.functional as F
+import torchvision
 from torch.utils.data import DataLoader, Dataset
 
 # ---------------------------------------------------------------------------
@@ -51,6 +54,11 @@ DEFAULT_VAL_RATIO = 0.1
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
 DEFAULT_DATASET_ROOT = os.path.join(CACHE_DIR, "vla_dataset")
 DATASET_ROOT_ENV = "AUTORESEARCH_VLA_DATASET"
+DEFAULT_LEROBOT_REPO = "LaZeAsh/uav-flow-lerobot-v3"
+LEROBOT_CACHE_ENV = "AUTORESEARCH_LEROBOT_CACHE"
+LEROBOT_REVISION_ENV = "AUTORESEARCH_LEROBOT_REVISION"
+DEFAULT_LEROBOT_REVISION = "main"
+LEROBOT_CAMERA_KEY = "observation.images.front"
 
 PAD_TOKEN_ID = 0
 BOS_TOKEN_ID = 1
@@ -72,6 +80,8 @@ ACTION_SPECIAL_TOKENS = {
 
 @dataclass(frozen=True)
 class DatasetMetadata:
+    backend: str
+    source_id: str
     dataset_root: str
     dataset_path: str
     episodes_path: str
@@ -109,6 +119,15 @@ class EpisodeRecord:
     states_path: str | None
     waypoints_path: str | None
     split: str
+    episode_index: int | None = None
+    data_chunk_index: int | None = None
+    data_file_index: int | None = None
+    dataset_from_index: int | None = None
+    dataset_to_index: int | None = None
+    video_chunk_index: int | None = None
+    video_file_index: int | None = None
+    video_from_timestamp: float | None = None
+    video_to_timestamp: float | None = None
 
 
 @dataclass(frozen=True)
@@ -266,11 +285,61 @@ class ActionTokenizer:
 
 
 # ---------------------------------------------------------------------------
-# Manifest loading
+# Dataset source loading
 # ---------------------------------------------------------------------------
 
-def _resolve_dataset_root(dataset_root: str | None = None) -> str:
-    return os.path.abspath(dataset_root or os.environ.get(DATASET_ROOT_ENV, DEFAULT_DATASET_ROOT))
+def _resolve_dataset_source(dataset_root: str | None = None) -> tuple[str, str]:
+    source = dataset_root or os.environ.get(DATASET_ROOT_ENV)
+    if source is None:
+        if os.path.exists(DEFAULT_DATASET_ROOT):
+            return "manifest", os.path.abspath(DEFAULT_DATASET_ROOT)
+        return "lerobot", DEFAULT_LEROBOT_REPO
+
+    source = source.strip()
+    candidate_path = os.path.abspath(source)
+    if os.path.exists(candidate_path):
+        return "manifest", candidate_path
+    if "/" in source and not source.startswith("/"):
+        return "lerobot", source
+    return "manifest", candidate_path
+
+
+def _resolve_lerobot_cache_root() -> str:
+    cache_root = os.environ.get(LEROBOT_CACHE_ENV)
+    if cache_root:
+        return os.path.abspath(cache_root)
+    return os.path.join(CACHE_DIR, "lerobot")
+
+
+def _resolve_lerobot_local_root(repo_id: str) -> str:
+    return os.path.join(_resolve_lerobot_cache_root(), repo_id)
+
+
+def _configure_hf_environment(cache_root: str) -> None:
+    hf_home = os.path.join(cache_root, ".hf_home")
+    os.makedirs(hf_home, exist_ok=True)
+    os.environ["HF_HOME"] = hf_home
+    os.environ["HF_DATASETS_CACHE"] = os.path.join(hf_home, "datasets")
+    os.environ["HF_HUB_CACHE"] = os.path.join(hf_home, "hub")
+    os.environ["HUGGINGFACE_HUB_CACHE"] = os.path.join(hf_home, "hub")
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
+
+
+def _snapshot_lerobot_repo(repo_id: str, allow_patterns: list[str] | str) -> str:
+    from huggingface_hub import snapshot_download
+
+    cache_root = _resolve_lerobot_cache_root()
+    local_root = _resolve_lerobot_local_root(repo_id)
+    os.makedirs(local_root, exist_ok=True)
+    _configure_hf_environment(cache_root)
+    snapshot_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        revision=os.environ.get(LEROBOT_REVISION_ENV, DEFAULT_LEROBOT_REVISION),
+        local_dir=local_root,
+        allow_patterns=allow_patterns,
+    )
+    return local_root
 
 
 def _load_json(path: str) -> dict[str, Any]:
@@ -291,8 +360,14 @@ def _as_float_tuple(value: Any, expected_len: int, field_name: str) -> tuple[flo
     return tuple(float(x) for x in value)
 
 
-def load_dataset_metadata(dataset_root: str | None = None) -> DatasetMetadata:
-    dataset_root = _resolve_dataset_root(dataset_root)
+def _flatten_stat(value: Any, expected_len: int, field_name: str) -> tuple[float, ...]:
+    flat = np.asarray(value, dtype=np.float32).reshape(-1)
+    if flat.size != expected_len:
+        raise ValueError(f"{field_name} must flatten to length {expected_len}, got {flat.size}")
+    return tuple(float(x) for x in flat.tolist())
+
+
+def _load_manifest_metadata(dataset_root: str) -> DatasetMetadata:
     dataset_path = os.path.join(dataset_root, "dataset.json")
     episodes_path = os.path.join(dataset_root, "episodes.jsonl")
     _require_file(dataset_path)
@@ -304,6 +379,8 @@ def load_dataset_metadata(dataset_root: str | None = None) -> DatasetMetadata:
     state_dim = int(raw.get("state_dim", 0))
     waypoint_dim = int(raw.get("waypoint_dim", 0))
     metadata = DatasetMetadata(
+        backend="manifest",
+        source_id=dataset_root,
         dataset_root=dataset_root,
         dataset_path=dataset_path,
         episodes_path=episodes_path,
@@ -337,6 +414,71 @@ def load_dataset_metadata(dataset_root: str | None = None) -> DatasetMetadata:
     return metadata
 
 
+def _load_lerobot_metadata(repo_id: str) -> DatasetMetadata:
+    local_root = _snapshot_lerobot_repo(
+        repo_id,
+        allow_patterns=[
+            "meta/info.json",
+            "meta/stats.json",
+            "meta/tasks.parquet",
+            "meta/episodes/**",
+        ],
+    )
+    info_path = os.path.join(local_root, "meta", "info.json")
+    stats_path = os.path.join(local_root, "meta", "stats.json")
+    episodes_path = os.path.join(local_root, "meta", "episodes", "chunk-000", "file-000.parquet")
+    _require_file(info_path)
+    _require_file(stats_path)
+    _require_file(episodes_path)
+    info = _load_json(info_path)
+    stats = _load_json(stats_path)
+
+    image_feature = info["features"][LEROBOT_CAMERA_KEY]
+    image_channels, image_height, image_width = (int(x) for x in image_feature["shape"])
+    image_size = min(image_height, image_width)
+    state_dim = int(info["features"]["observation.state"]["shape"][0])
+    action_dim = int(info["features"]["action"]["shape"][0])
+    waypoint_dim = 0
+
+    metadata = DatasetMetadata(
+        backend="lerobot",
+        source_id=repo_id,
+        dataset_root=local_root,
+        dataset_path=info_path,
+        episodes_path=episodes_path,
+        image_size=image_size,
+        image_channels=image_channels,
+        frame_mean=_flatten_stat(stats[LEROBOT_CAMERA_KEY]["mean"], image_channels, "frame_mean"),
+        frame_std=_flatten_stat(stats[LEROBOT_CAMERA_KEY]["std"], image_channels, "frame_std"),
+        instruction_template="Task: {instruction}",
+        val_ratio=DEFAULT_VAL_RATIO,
+        state_dim=state_dim,
+        state_mean=_as_float_tuple(stats["observation.state"]["mean"], state_dim, "state_mean"),
+        state_std=_as_float_tuple(stats["observation.state"]["std"], state_dim, "state_std"),
+        action_dim=action_dim,
+        action_low=_as_float_tuple(stats["action"]["min"], action_dim, "action_low"),
+        action_high=_as_float_tuple(stats["action"]["max"], action_dim, "action_high"),
+        action_bins=256,
+        waypoint_dim=waypoint_dim,
+        score_weights={
+            "action_ce": 1.0,
+            "waypoint_mse": 0.25,
+            "latency_ms": 0.0025,
+            "invalid_action_rate": 1.0,
+        },
+    )
+    if metadata.image_size <= 0:
+        raise ValueError("image_size must be > 0")
+    return metadata
+
+
+def load_dataset_metadata(dataset_root: str | None = None) -> DatasetMetadata:
+    backend, source = _resolve_dataset_source(dataset_root)
+    if backend == "lerobot":
+        return _load_lerobot_metadata(source)
+    return _load_manifest_metadata(source)
+
+
 def _stable_split(episode_id: str, val_ratio: float) -> str:
     digest = hashlib.sha1(episode_id.encode("utf-8")).hexdigest()
     bucket = int(digest[:8], 16) / 0xFFFFFFFF
@@ -347,7 +489,7 @@ def _normalize_path(dataset_root: str, path: str) -> str:
     return path if os.path.isabs(path) else os.path.join(dataset_root, path)
 
 
-def load_episode_records(metadata: DatasetMetadata) -> list[EpisodeRecord]:
+def _load_manifest_episode_records(metadata: DatasetMetadata) -> list[EpisodeRecord]:
     records = []
     with open(metadata.episodes_path, "r", encoding="utf-8") as f:
         for line_number, raw_line in enumerate(f, start=1):
@@ -385,6 +527,45 @@ def load_episode_records(metadata: DatasetMetadata) -> list[EpisodeRecord]:
     if not records:
         raise ValueError("episodes.jsonl is empty")
     return records
+
+
+def _load_lerobot_episode_records(metadata: DatasetMetadata) -> list[EpisodeRecord]:
+    episode_table = pq.read_table(metadata.episodes_path)
+    rows = episode_table.to_pylist()
+    records = []
+    for row in rows:
+        episode_index = int(row["episode_index"])
+        episode_id = f"ep-{episode_index:06d}"
+        tasks = row.get("tasks") or []
+        instruction = str(tasks[0]) if tasks else ""
+        record = EpisodeRecord(
+            episode_id=episode_id,
+            instruction=instruction,
+            frame_paths=(),
+            actions_path="",
+            states_path=None,
+            waypoints_path=None,
+            split=_stable_split(episode_id, metadata.val_ratio),
+            episode_index=episode_index,
+            data_chunk_index=int(row["data/chunk_index"]),
+            data_file_index=int(row["data/file_index"]),
+            dataset_from_index=int(row["dataset_from_index"]),
+            dataset_to_index=int(row["dataset_to_index"]),
+            video_chunk_index=int(row[f"videos/{LEROBOT_CAMERA_KEY}/chunk_index"]),
+            video_file_index=int(row[f"videos/{LEROBOT_CAMERA_KEY}/file_index"]),
+            video_from_timestamp=float(row[f"videos/{LEROBOT_CAMERA_KEY}/from_timestamp"]),
+            video_to_timestamp=float(row[f"videos/{LEROBOT_CAMERA_KEY}/to_timestamp"]),
+        )
+        records.append(record)
+    if not records:
+        raise ValueError("LeRobot episodes metadata is empty")
+    return records
+
+
+def load_episode_records(metadata: DatasetMetadata) -> list[EpisodeRecord]:
+    if metadata.backend == "lerobot":
+        return _load_lerobot_episode_records(metadata)
+    return _load_manifest_episode_records(metadata)
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +629,38 @@ def _prepare_states(states: torch.Tensor, metadata: DatasetMetadata) -> torch.Te
     return (states.to(torch.float32) - mean) / std.clamp_min(1e-6)
 
 
+def _validate_episode_payload(metadata: DatasetMetadata, record: EpisodeRecord, payload: dict[str, torch.Tensor]) -> None:
+    frames = payload["frames"]
+    actions = payload["actions"]
+    if actions.ndim != 2 or actions.size(-1) != metadata.action_dim:
+        raise ValueError(
+            f"Episode {record.episode_id!r} actions must be [T, {metadata.action_dim}], got {tuple(actions.shape)}"
+        )
+    if frames.size(0) != actions.size(0):
+        raise ValueError(
+            f"Episode {record.episode_id!r} has mismatched lengths: frames={frames.size(0)}, actions={actions.size(0)}"
+        )
+    if metadata.has_state:
+        states = payload["states"]
+        if states.size(0) != actions.size(0):
+            raise ValueError(
+                f"Episode {record.episode_id!r} has mismatched states/actions lengths: "
+                f"{states.size(0)} vs {actions.size(0)}"
+            )
+    if "waypoints" in payload:
+        waypoints = payload["waypoints"]
+        if waypoints.ndim != 2 or waypoints.size(-1) != metadata.waypoint_dim:
+            raise ValueError(
+                f"Episode {record.episode_id!r} waypoints must be [T, {metadata.waypoint_dim}], "
+                f"got {tuple(waypoints.shape)}"
+            )
+        if waypoints.size(0) != actions.size(0):
+            raise ValueError(
+                f"Episode {record.episode_id!r} has mismatched waypoint/action lengths: "
+                f"{waypoints.size(0)} vs {actions.size(0)}"
+            )
+
+
 class EpisodeCache:
     """Small LRU cache so repeated windows from the same episode do not thrash disk."""
 
@@ -477,43 +690,93 @@ class EpisodeCache:
             )
         if record.waypoints_path is not None:
             payload["waypoints"] = _load_tensor(record.waypoints_path).to(torch.float32)
-        self._validate_episode_shapes(record, payload)
+        _validate_episode_payload(self.metadata, record, payload)
         self.cache[record.episode_id] = payload
         while len(self.cache) > self.max_items:
             self.cache.popitem(last=False)
         return payload
 
-    def _validate_episode_shapes(self, record: EpisodeRecord, payload: dict[str, torch.Tensor]) -> None:
-        frames = payload["frames"]
-        actions = payload["actions"]
-        if actions.ndim != 2 or actions.size(-1) != self.metadata.action_dim:
-            raise ValueError(
-                f"Episode {record.episode_id!r} actions must be [T, {self.metadata.action_dim}], "
-                f"got {tuple(actions.shape)}"
-            )
-        if frames.size(0) != actions.size(0):
-            raise ValueError(
-                f"Episode {record.episode_id!r} has mismatched lengths: frames={frames.size(0)}, actions={actions.size(0)}"
-            )
+def _lerobot_data_file_path(metadata: DatasetMetadata, record: EpisodeRecord) -> str:
+    if record.data_chunk_index is None or record.data_file_index is None:
+        raise ValueError(f"Episode {record.episode_id!r} is missing LeRobot data file indices")
+    info = _load_json(metadata.dataset_path)
+    relative = info["data_path"].format(chunk_index=record.data_chunk_index, file_index=record.data_file_index)
+    return os.path.join(metadata.dataset_root, relative)
+
+
+def _lerobot_video_file_path(metadata: DatasetMetadata, record: EpisodeRecord) -> str:
+    if record.video_chunk_index is None or record.video_file_index is None:
+        raise ValueError(f"Episode {record.episode_id!r} is missing LeRobot video file indices")
+    info = _load_json(metadata.dataset_path)
+    relative = info["video_path"].format(
+        video_key=LEROBOT_CAMERA_KEY,
+        chunk_index=record.video_chunk_index,
+        file_index=record.video_file_index,
+    )
+    return os.path.join(metadata.dataset_root, relative)
+
+
+class LeRobotEpisodeCache:
+    """Episode cache that reads LeRobot v3 parquet/video shards."""
+
+    def __init__(self, metadata: DatasetMetadata, max_items: int = 8):
+        self.metadata = metadata
+        self.max_items = max_items
+        self.cache: OrderedDict[str, dict[str, torch.Tensor]] = OrderedDict()
+        self.data_file_cache: dict[str, dict[str, torch.Tensor]] = {}
+
+    def get(self, record: EpisodeRecord) -> dict[str, torch.Tensor]:
+        if record.episode_id in self.cache:
+            payload = self.cache.pop(record.episode_id)
+            self.cache[record.episode_id] = payload
+            return payload
+
+        data_payload = self._load_data_slice(record)
+        frames = self._load_video_frames(record, expected_length=data_payload["actions"].size(0))
+        payload = {
+            "frames": _prepare_frames(frames, self.metadata),
+            "actions": data_payload["actions"],
+        }
         if self.metadata.has_state:
-            states = payload["states"]
-            if states.size(0) != actions.size(0):
-                raise ValueError(
-                    f"Episode {record.episode_id!r} has mismatched states/actions lengths: "
-                    f"{states.size(0)} vs {actions.size(0)}"
-                )
-        if "waypoints" in payload:
-            waypoints = payload["waypoints"]
-            if waypoints.ndim != 2 or waypoints.size(-1) != self.metadata.waypoint_dim:
-                raise ValueError(
-                    f"Episode {record.episode_id!r} waypoints must be [T, {self.metadata.waypoint_dim}], "
-                    f"got {tuple(waypoints.shape)}"
-                )
-            if waypoints.size(0) != actions.size(0):
-                raise ValueError(
-                    f"Episode {record.episode_id!r} has mismatched waypoint/action lengths: "
-                    f"{waypoints.size(0)} vs {actions.size(0)}"
-                )
+            payload["states"] = _prepare_states(data_payload["states"], self.metadata)
+        _validate_episode_payload(self.metadata, record, payload)
+        self.cache[record.episode_id] = payload
+        while len(self.cache) > self.max_items:
+            self.cache.popitem(last=False)
+        return payload
+
+    def _load_data_slice(self, record: EpisodeRecord) -> dict[str, torch.Tensor]:
+        data_path = _lerobot_data_file_path(self.metadata, record)
+        if data_path not in self.data_file_cache:
+            table = pq.read_table(data_path, columns=["observation.state", "action"])
+            table_dict = table.to_pydict()
+            self.data_file_cache[data_path] = {
+                "states": torch.tensor(np.asarray(table_dict["observation.state"], dtype=np.float32)),
+                "actions": torch.tensor(np.asarray(table_dict["action"], dtype=np.float32)),
+            }
+
+        if record.dataset_from_index is None or record.dataset_to_index is None:
+            raise ValueError(f"Episode {record.episode_id!r} is missing LeRobot data row offsets")
+        data_file = self.data_file_cache[data_path]
+        start = record.dataset_from_index
+        end = record.dataset_to_index
+        return {
+            "states": data_file["states"][start:end],
+            "actions": data_file["actions"][start:end],
+        }
+
+    def _load_video_frames(self, record: EpisodeRecord, expected_length: int) -> torch.Tensor:
+        video_path = _lerobot_video_file_path(self.metadata, record)
+        start = float(record.video_from_timestamp or 0.0)
+        end = float(record.video_to_timestamp or start)
+        frames, _, _ = torchvision.io.read_video(video_path, start_pts=start, end_pts=end, pts_unit="sec")
+        if frames.size(0) < expected_length:
+            raise ValueError(
+                f"Episode {record.episode_id!r} decoded only {frames.size(0)} frames, expected {expected_length}"
+            )
+        if frames.size(0) > expected_length:
+            frames = frames[:expected_length]
+        return frames
 
 
 # ---------------------------------------------------------------------------
@@ -529,6 +792,7 @@ class EpisodeWindowDataset(Dataset):
         instruction_tokenizer: Tokenizer,
         action_tokenizer: ActionTokenizer,
         runtime: RuntimeConfig,
+        cache: EpisodeCache | LeRobotEpisodeCache | None = None,
     ):
         self.metadata = metadata
         self.records = [record for record in records if record.split == split]
@@ -537,7 +801,7 @@ class EpisodeWindowDataset(Dataset):
         self.instruction_tokenizer = instruction_tokenizer
         self.action_tokenizer = action_tokenizer
         self.runtime = runtime
-        self.cache = EpisodeCache(metadata)
+        self.cache = cache or EpisodeCache(metadata)
         self.samples = self._build_index()
 
     def _build_index(self) -> list[tuple[int, int]]:
@@ -547,8 +811,11 @@ class EpisodeWindowDataset(Dataset):
             self.runtime.past_action_chunk_size if self.runtime.include_past_actions else 0,
         )
         for record_index, record in enumerate(self.records):
-            payload = self.cache.get(record)
-            total_steps = payload["actions"].size(0)
+            if record.dataset_from_index is not None and record.dataset_to_index is not None:
+                total_steps = record.dataset_to_index - record.dataset_from_index
+            else:
+                payload = self.cache.get(record)
+                total_steps = payload["actions"].size(0)
             max_t = total_steps - self.runtime.action_chunk_size + 1
             for t in range(min_t, max_t):
                 samples.append((record_index, t))
@@ -641,6 +908,8 @@ def build_vla_runtime(
 ) -> VLARuntime:
     metadata = load_dataset_metadata(dataset_root)
     records = load_episode_records(metadata)
+    if metadata.backend == "lerobot":
+        _snapshot_lerobot_repo(metadata.source_id, allow_patterns=["data/**", "videos/**"])
     instruction_tokenizer = Tokenizer()
     action_tokenizer = ActionTokenizer(metadata)
     runtime = RuntimeConfig(
@@ -655,6 +924,9 @@ def build_vla_runtime(
         num_workers=num_workers,
         pin_memory=pin_memory,
     )
+    cache: EpisodeCache | LeRobotEpisodeCache | None = None
+    if metadata.backend == "lerobot":
+        cache = LeRobotEpisodeCache(metadata)
     train_dataset = EpisodeWindowDataset(
         metadata=metadata,
         records=records,
@@ -662,6 +934,7 @@ def build_vla_runtime(
         instruction_tokenizer=instruction_tokenizer,
         action_tokenizer=action_tokenizer,
         runtime=runtime,
+        cache=cache,
     )
     val_dataset = EpisodeWindowDataset(
         metadata=metadata,
@@ -670,11 +943,12 @@ def build_vla_runtime(
         instruction_tokenizer=instruction_tokenizer,
         action_tokenizer=action_tokenizer,
         runtime=runtime,
+        cache=cache,
     )
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=metadata.backend != "lerobot",
         drop_last=True,
         num_workers=num_workers,
         pin_memory=pin_memory,
@@ -701,7 +975,14 @@ def build_vla_runtime(
 
 
 def move_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device | str) -> dict[str, torch.Tensor]:
-    return {key: value.to(device, non_blocking=True) for key, value in batch.items()}
+    keep_on_cpu = {"frames", "instruction_tokens", "instruction_mask"}
+    moved = {}
+    for key, value in batch.items():
+        if key in keep_on_cpu:
+            moved[key] = value
+        else:
+            moved[key] = value.to(device, non_blocking=True)
+    return moved
 
 
 def cycle(loader: DataLoader):
@@ -821,6 +1102,8 @@ def format_eval_summary(metrics: dict[str, float]) -> list[str]:
 def print_dataset_summary(metadata: DatasetMetadata, records: list[EpisodeRecord]) -> None:
     train_count = sum(1 for record in records if record.split == "train")
     val_count = sum(1 for record in records if record.split == "val")
+    print(f"backend:            {metadata.backend}")
+    print(f"source:             {metadata.source_id}")
     print(f"dataset_root:       {metadata.dataset_root}")
     print(f"episodes:           {len(records)}")
     print(f"train_episodes:     {train_count}")
