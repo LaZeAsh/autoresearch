@@ -199,7 +199,6 @@ class FrozenSmolVLMActionPolicy(nn.Module):
             )
 
         self.instruction_tokenizer = instruction_tokenizer
-        self.prompt_cache: dict[str, str] = {}
         self.backbone_dtype = getattr(torch, config.backbone_dtype)
 
         self.processor = AutoProcessor.from_pretrained(config.smolvlm_model_id)
@@ -218,6 +217,19 @@ class FrozenSmolVLMActionPolicy(nn.Module):
             total_layers = len(self.smolvlm.text_model.layers)
             keep = min(BACKBONE_SKIP_LAYERS, total_layers)
             self.smolvlm.text_model.layers = self.smolvlm.text_model.layers[:keep]
+
+        # Pre-compute normalization constants for fast GPU preprocessing
+        # Dataset normalization: frame = (raw - mean) / std
+        # SmolVLM expects: (raw / 255 - 0.5) / 0.5 but since do_rescale=False,
+        # the processor normally gets [0,1] images and does (x - 0.5)/0.5 = 2x - 1
+        # Combined: smolvlm_input = 2*(frame*std + mean) - 1 = 2*std*frame + 2*mean - 1
+        frame_mean = torch.tensor(config.frame_mean, dtype=torch.float32).view(1, 1, -1, 1, 1)
+        frame_std = torch.tensor(config.frame_std, dtype=torch.float32).view(1, 1, -1, 1, 1)
+        self.register_buffer("_norm_scale", 2.0 * frame_std)
+        self.register_buffer("_norm_bias", 2.0 * frame_mean - 1.0)
+
+        # Cache for tokenized input_ids per instruction
+        self._input_ids_cache: dict[str, torch.Tensor] = {}
 
         self.context_proj = nn.Linear(config.backbone_hidden_size, config.n_embd, bias=False)
         self.action_embed = nn.Embedding(config.action_vocab_size, config.n_embd)
@@ -269,8 +281,9 @@ class FrozenSmolVLMActionPolicy(nn.Module):
         tokens_cpu = instruction_tokens.detach().cpu()
         return [self.instruction_tokenizer.decode(row) for row in tokens_cpu]
 
-    def _build_prompt(self, instruction: str) -> str:
-        cached = self.prompt_cache.get(instruction)
+    def _get_input_ids(self, instruction: str) -> torch.Tensor:
+        """Get tokenized input_ids for an instruction (cached)."""
+        cached = self._input_ids_cache.get(instruction)
         if cached is not None:
             return cached
         message = [
@@ -281,33 +294,43 @@ class FrozenSmolVLMActionPolicy(nn.Module):
             }
         ]
         prompt = self.processor.apply_chat_template(message, add_generation_prompt=False)
-        self.prompt_cache[instruction] = prompt
-        return prompt
-
-    def _frames_to_images(self, frames: torch.Tensor) -> list[list[torch.Tensor]]:
-        frames_cpu = frames.detach().cpu().to(torch.float32)
-        mean = torch.tensor(self.config.frame_mean, dtype=torch.float32).view(1, 1, -1, 1, 1)
-        std = torch.tensor(self.config.frame_std, dtype=torch.float32).view(1, 1, -1, 1, 1)
-        raw_frames = (frames_cpu * std + mean).clamp_(0.0, 1.0)
-        return [[frame for frame in sample] for sample in raw_frames]
+        ids = self.processor.tokenizer(prompt, return_tensors="pt").input_ids[0]
+        self._input_ids_cache[instruction] = ids
+        return ids
 
     def _prepare_backbone_inputs(self, batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
+        """Fast preprocessing: resize+normalize on GPU, cached text tokenization."""
+        frames = batch["frames"]  # [B, T, C, H, W] on CPU, dataset-normalized
+        B, T, C, H, W = frames.shape
+
+        # Convert frames to SmolVLM normalization on GPU
+        frames_gpu = frames.to(device=device, dtype=torch.float32)
+        pixel_values = frames_gpu * self._norm_scale.to(device) + self._norm_bias.to(device)
+
+        # Resize to 512x512 (SmolVLM's expected resolution)
+        pixel_values = pixel_values.reshape(B * T, C, H, W)
+        if H != 512 or W != 512:
+            pixel_values = F.interpolate(pixel_values, size=(512, 512), mode="bilinear", align_corners=False)
+        pixel_values = pixel_values.reshape(B, T, C, 512, 512).to(dtype=self.backbone_dtype)
+
+        # Get cached input_ids for each instruction
         instructions = self._decode_instruction_texts(batch["instruction_tokens"])
-        prompts = [self._build_prompt(text) for text in instructions]
-        images = self._frames_to_images(batch["frames"])
-        inputs = self.processor(
-            text=prompts,
-            images=images,
-            return_tensors="pt",
-            padding=True,
-        )
-        prepared = {}
-        for key, value in inputs.items():
-            if torch.is_floating_point(value):
-                prepared[key] = value.to(device=device, dtype=self.backbone_dtype)
-            else:
-                prepared[key] = value.to(device)
-        return prepared
+        ids_list = [self._get_input_ids(text) for text in instructions]
+        max_len = max(ids.shape[0] for ids in ids_list)
+        input_ids = torch.zeros(B, max_len, dtype=torch.long, device=device)
+        attention_mask = torch.zeros(B, max_len, dtype=torch.long, device=device)
+        for i, ids in enumerate(ids_list):
+            input_ids[i, : ids.shape[0]] = ids.to(device)
+            attention_mask[i, : ids.shape[0]] = 1
+
+        pixel_attention_mask = torch.ones(B, T, 512, 512, dtype=torch.long, device=device)
+
+        return {
+            "pixel_values": pixel_values,
+            "pixel_attention_mask": pixel_attention_mask,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
 
     def _build_attention_mask(
         self,
