@@ -84,7 +84,7 @@ NUM_WORKERS = 0
 PIN_MEMORY = True
 
 # Evaluation
-EVAL_BATCH_SIZE = 2  # Separate eval batch size for lower latency
+EVAL_BATCH_SIZE = 1  # Separate eval batch size for lower latency
 VAL_EVAL_BATCHES = DEFAULT_EVAL_BATCHES
 
 
