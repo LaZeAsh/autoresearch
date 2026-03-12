@@ -62,7 +62,7 @@ LORA_RANK = 0  # LoRA rank for backbone adaptation (0 = no LoRA)
 LORA_ALPHA = 16.0  # LoRA scaling factor
 
 # Trainable action policy
-DEPTH = 4
+DEPTH = 6
 N_HEAD = 8
 N_EMBD = 512
 MLP_RATIO = 4.0
