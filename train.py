@@ -384,7 +384,7 @@ class FrozenSmolVLMActionPolicy(nn.Module):
         causal = torch.ones(seq_len, seq_len, dtype=torch.bool, device=device).tril()
         return causal.unsqueeze(0).unsqueeze(1) & keep_mask[:, None, None, :]
 
-    def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor | None]:
+    def forward(self, batch: dict[str, torch.Tensor], cached_context: torch.Tensor | None = None) -> dict[str, torch.Tensor | None]:
         target_action_tokens = batch["target_action_tokens"]
         past_action_tokens = batch["past_action_tokens"]
 
@@ -392,8 +392,11 @@ class FrozenSmolVLMActionPolicy(nn.Module):
         target_len = target_action_tokens.size(1)
         device = target_action_tokens.device
 
-        # Backbone (frozen)
-        if USE_BACKBONE_LM:
+        # Use cached context if provided
+        if cached_context is not None:
+            context_hidden = cached_context.to(device=device, dtype=self.context_proj.weight.dtype)
+            context_mask = torch.ones(batch_size, context_hidden.size(1), dtype=torch.long, device=device)
+        elif USE_BACKBONE_LM:
             backbone_inputs = self._prepare_backbone_inputs(batch, device)
             if LORA_RANK > 0:
                 backbone_outputs = self.smolvlm(**backbone_inputs)
@@ -623,12 +626,62 @@ optimizer = torch.optim.AdamW(
 for group in optimizer.param_groups:
     group["initial_lr"] = group["lr"]
 
-train_batches = cycle(runtime.train_loader)
-batch_cpu, epoch = next(train_batches)
-
 print(f"Device: {device}")
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
+
+# ---------------------------------------------------------------------------
+# Feature caching (runs outside training time budget)
+# ---------------------------------------------------------------------------
+
+CACHE_FEATURES = not USE_BACKBONE_LM  # Only cache when using vision-only path
+cached_contexts = None
+cached_states = None
+cached_past_actions = None
+cached_target_actions = None
+cached_waypoints = None
+
+if CACHE_FEATURES:
+    print("Caching backbone features...")
+    t_cache = time.time()
+    ctx_list, st_list, pa_list, ta_list, wp_list = [], [], [], [], []
+    model.eval()
+    with torch.no_grad(), autocast_context():
+        for batch_idx, batch_cpu in enumerate(runtime.train_loader):
+            batch = move_batch_to_device(batch_cpu, device)
+            frames = batch["frames"]
+            B_c, T_c, C_c, H_c, W_c = frames.shape
+            frames_gpu = frames.to(device=device, dtype=torch.float32)
+            pv = frames_gpu * model._norm_scale.to(device) + model._norm_bias.to(device)
+            pv = pv.reshape(B_c * T_c, C_c, H_c, W_c)
+            if H_c != 512 or W_c != 512:
+                pv = F.interpolate(pv, size=(512, 512), mode="bilinear", align_corners=False)
+            pv = pv.to(dtype=model.backbone_dtype)
+            vo = model.smolvlm.vision_model(pv).last_hidden_state
+            vo = model.smolvlm.vision_model.post_layernorm(vo)
+            ch = model.smolvlm.connector(vo)
+            n_v = ch.size(1)
+            ch = ch.reshape(B_c, T_c * n_v, -1)
+            ctx_list.append(ch.cpu().to(torch.bfloat16))
+            st_list.append(batch["states"].cpu())
+            pa_list.append(batch["past_action_tokens"].cpu())
+            ta_list.append(batch["target_action_tokens"].cpu())
+            wp_list.append(batch["waypoints"].cpu())
+    cached_contexts = torch.cat(ctx_list)
+    cached_states = torch.cat(st_list)
+    cached_past_actions = torch.cat(pa_list)
+    cached_target_actions = torch.cat(ta_list)
+    cached_waypoints = torch.cat(wp_list)
+    n_cached = cached_contexts.size(0)
+    print(f"Cached {n_cached} windows in {time.time() - t_cache:.1f}s ({cached_contexts.nbytes / 1e9:.1f} GB)")
+    model.train()
+    # Free GPU memory used during caching
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+if not CACHE_FEATURES:
+    train_batches = cycle(runtime.train_loader)
+    batch_cpu, epoch = next(train_batches)
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +695,8 @@ smooth_waypoint_loss = 0.0
 total_training_time = 0.0
 step = 0
 total_windows = 0
+cache_idx = 0
+cache_epoch = 1
 
 while True:
     if device.type == "cuda":
@@ -652,16 +707,42 @@ while True:
     micro_waypoint_loss = 0.0
     micro_total_loss = 0.0
     for _ in range(grad_accum_steps):
-        batch = move_batch_to_device(batch_cpu, device)
-        with autocast_context():
-            outputs = model(batch)
-            loss, loss_metrics = compute_loss(outputs, batch)
+        if CACHE_FEATURES:
+            # Sample a random batch from cached features
+            if cache_idx + DEVICE_BATCH_SIZE > n_cached:
+                cache_idx = 0
+                cache_epoch += 1
+                # Shuffle indices for next epoch
+                perm = torch.randperm(n_cached)
+                cached_contexts = cached_contexts[perm]
+                cached_states = cached_states[perm]
+                cached_past_actions = cached_past_actions[perm]
+                cached_target_actions = cached_target_actions[perm]
+                cached_waypoints = cached_waypoints[perm]
+            end_idx = cache_idx + DEVICE_BATCH_SIZE
+            batch = {
+                "states": cached_states[cache_idx:end_idx].to(device, non_blocking=True),
+                "past_action_tokens": cached_past_actions[cache_idx:end_idx].to(device, non_blocking=True),
+                "target_action_tokens": cached_target_actions[cache_idx:end_idx].to(device, non_blocking=True),
+                "waypoints": cached_waypoints[cache_idx:end_idx].to(device, non_blocking=True),
+            }
+            ctx = cached_contexts[cache_idx:end_idx]
+            cache_idx = end_idx
+            with autocast_context():
+                outputs = model(batch, cached_context=ctx)
+                loss, loss_metrics = compute_loss(outputs, batch)
+            epoch = cache_epoch
+        else:
+            batch = move_batch_to_device(batch_cpu, device)
+            with autocast_context():
+                outputs = model(batch)
+                loss, loss_metrics = compute_loss(outputs, batch)
+            batch_cpu, epoch = next(train_batches)
         (loss / grad_accum_steps).backward()
         micro_total_loss += loss.detach().item()
         micro_action_ce += loss_metrics["action_ce"]
         micro_waypoint_loss += loss_metrics["waypoint_loss"]
-        total_windows += batch["frames"].size(0)
-        batch_cpu, epoch = next(train_batches)
+        total_windows += DEVICE_BATCH_SIZE
 
     progress = min(total_training_time / TIME_BUDGET, 1.0)
     lr_multiplier = get_lr_multiplier(progress)
