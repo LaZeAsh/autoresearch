@@ -57,6 +57,7 @@ SMOLVLM_MODEL_ID = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
 SMOLVLM_DTYPE = "bfloat16"
 MAX_CONTEXT_TOKENS = 512
 BACKBONE_SKIP_LAYERS = 8  # Use only first N of 32 LM layers (0 = use all)
+USE_BACKBONE_LM = False  # Skip LM layers, use only vision encoder + connector
 LORA_RANK = 0  # LoRA rank for backbone adaptation (0 = no LoRA)
 LORA_ALPHA = 16.0  # LoRA scaling factor
 
@@ -391,18 +392,39 @@ class FrozenSmolVLMActionPolicy(nn.Module):
         target_len = target_action_tokens.size(1)
         device = target_action_tokens.device
 
-        # Backbone (frozen base weights, LoRA adapters are trainable)
-        backbone_inputs = self._prepare_backbone_inputs(batch, device)
-        if LORA_RANK > 0:
-            backbone_outputs = self.smolvlm(**backbone_inputs)
-        else:
-            with torch.no_grad():
+        # Backbone (frozen)
+        if USE_BACKBONE_LM:
+            backbone_inputs = self._prepare_backbone_inputs(batch, device)
+            if LORA_RANK > 0:
                 backbone_outputs = self.smolvlm(**backbone_inputs)
-        context_hidden = backbone_outputs.last_hidden_state
-        context_mask = backbone_inputs["attention_mask"]
-        if context_hidden.size(1) > self.config.max_context_tokens:
-            context_hidden = context_hidden[:, -self.config.max_context_tokens :]
-            context_mask = context_mask[:, -self.config.max_context_tokens :]
+            else:
+                with torch.no_grad():
+                    backbone_outputs = self.smolvlm(**backbone_inputs)
+            context_hidden = backbone_outputs.last_hidden_state
+            context_mask = backbone_inputs["attention_mask"]
+            if context_hidden.size(1) > self.config.max_context_tokens:
+                context_hidden = context_hidden[:, -self.config.max_context_tokens :]
+                context_mask = context_mask[:, -self.config.max_context_tokens :]
+        else:
+            # Vision-only: SigLIP + connector, skip LM layers entirely
+            frames = batch["frames"]  # [B, T, C, H, W]
+            B_f, T_f, C_f, H_f, W_f = frames.shape
+            frames_gpu = frames.to(device=device, dtype=torch.float32)
+            pixel_values = frames_gpu * self._norm_scale.to(device) + self._norm_bias.to(device)
+            pixel_values = pixel_values.reshape(B_f * T_f, C_f, H_f, W_f)
+            if H_f != 512 or W_f != 512:
+                pixel_values = F.interpolate(pixel_values, size=(512, 512), mode="bilinear", align_corners=False)
+            pixel_values = pixel_values.to(dtype=self.backbone_dtype)
+            with torch.no_grad():
+                vision_out = self.smolvlm.vision_model(pixel_values).last_hidden_state
+                vision_out = self.smolvlm.vision_model.post_layernorm(vision_out)
+                context_hidden = self.smolvlm.connector(vision_out)  # [B*T, 64, 960]
+            n_vis = context_hidden.size(1)
+            context_hidden = context_hidden.reshape(batch_size, T_f * n_vis, -1)
+            context_mask = torch.ones(batch_size, context_hidden.size(1), dtype=torch.long, device=device)
+            if context_hidden.size(1) > self.config.max_context_tokens:
+                context_hidden = context_hidden[:, :self.config.max_context_tokens]
+                context_mask = context_mask[:, :self.config.max_context_tokens]
         context_tokens = self.context_proj(context_hidden.to(dtype=self.context_proj.weight.dtype))
         context_tokens = context_tokens + self.type_embed.weight[0]
 
